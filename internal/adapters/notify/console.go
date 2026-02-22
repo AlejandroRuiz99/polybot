@@ -459,3 +459,118 @@ func sumFillCosts(opps []domain.Opportunity) float64 {
 	}
 	return total
 }
+
+// PrintPaperStatus prints a compact one-line status for the current paper cycle.
+func (c *Console) PrintPaperStatus(positions []domain.PaperPosition, newOrders, newFills int, alerts []string) {
+	now := time.Now().Format("15:04:05")
+
+	active, complete, partial := 0, 0, 0
+	for _, pos := range positions {
+		if pos.YesOrder == nil && pos.NoOrder == nil {
+			continue
+		}
+		active++
+		if pos.IsComplete {
+			complete++
+		}
+		if pos.PartialSince != nil && !pos.IsComplete {
+			partial++
+		}
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "[%s][PAPER] %d pos | %d complete | %d partial | +%d orders | +%d fills",
+		now, active, complete, partial, newOrders, newFills)
+
+	// Show top partial alerts
+	for i, alert := range alerts {
+		if i >= 2 {
+			break
+		}
+		fmt.Fprintf(&sb, "\n  !! %s", alert)
+	}
+
+	fmt.Fprintln(c.out, sb.String())
+}
+
+// PrintPaperReport prints a comprehensive paper trading report.
+func (c *Console) PrintPaperReport(stats domain.PaperStats) {
+	if stats.DaysRunning == 0 {
+		fmt.Fprintln(c.out, "\n  No paper trading data yet. Run --paper first for a few days.")
+		return
+	}
+
+	fmt.Fprintf(c.out, "\n")
+	fmt.Fprintf(c.out, "========================================================\n")
+	fmt.Fprintf(c.out, "  PAPER TRADING REPORT\n")
+	fmt.Fprintf(c.out, "  %s to %s (%d days)\n",
+		stats.StartDate.Format("2006-01-02"),
+		stats.EndDate.Format("2006-01-02"),
+		stats.DaysRunning)
+	fmt.Fprintf(c.out, "========================================================\n\n")
+
+	// Daily table
+	if len(stats.Dailies) > 0 {
+		tbl := tablewriter.NewWriter(c.out)
+		tbl.Header("Date", "Pos", "Pairs", "Partials", "FillsY", "FillsN", "FillPnL", "NetPnL")
+
+		for _, d := range stats.Dailies {
+			tbl.Append(
+				d.Date.Format("01-02"),
+				fmt.Sprintf("%d", d.ActivePositions),
+				fmt.Sprintf("%d", d.CompletePairs),
+				fmt.Sprintf("%d", d.PartialFills),
+				fmt.Sprintf("%d", d.FillsYes),
+				fmt.Sprintf("%d", d.FillsNo),
+				fmt.Sprintf("$%.4f", d.TotalFillPnL),
+				fmt.Sprintf("$%.4f", d.NetPnL),
+			)
+		}
+		tbl.Render()
+	}
+
+	// Aggregate stats
+	fmt.Fprintf(c.out, "\n  --- AGGREGATE ---\n")
+	fmt.Fprintf(c.out, "  Markets monitored:     %d\n", stats.MarketsMonitored)
+	fmt.Fprintf(c.out, "  Total orders placed:   %d\n", stats.TotalOrders)
+	fmt.Fprintf(c.out, "  Total fills:           %d\n", stats.TotalFills)
+	fmt.Fprintf(c.out, "  Complete pairs:        %d\n", stats.CompletePairs)
+	fmt.Fprintf(c.out, "  Partial fills:         %d\n", stats.PartialFills)
+	fmt.Fprintf(c.out, "  Fill rate (real):      %.1f fills/day\n", stats.FillRateReal)
+
+	fmt.Fprintf(c.out, "\n  --- PARTIAL FILL RISK ---\n")
+	fmt.Fprintf(c.out, "  Max partial duration:  %.0f min\n", stats.MaxPartialMins)
+	if stats.TotalFills > 0 {
+		partialPct := float64(stats.PartialFills) / float64(stats.TotalFills) * 100
+		fmt.Fprintf(c.out, "  Partial rate:          %.1f%% of all fills\n", partialPct)
+	}
+
+	fmt.Fprintf(c.out, "\n  --- P&L ---\n")
+	fmt.Fprintf(c.out, "  Total fill PnL:        $%.4f\n", stats.TotalFillPnL)
+	fmt.Fprintf(c.out, "  Total net PnL:         $%.4f\n", stats.NetPnL)
+	fmt.Fprintf(c.out, "  Daily avg PnL:         $%.4f/day\n", stats.DailyAvgPnL)
+	if stats.DaysRunning >= 7 {
+		monthly := stats.DailyAvgPnL * 30
+		fmt.Fprintf(c.out, "  Projected monthly:     $%.2f/month\n", monthly)
+	}
+
+	fmt.Fprintf(c.out, "\n  --- VERDICT ---\n")
+	if stats.DaysRunning < 7 {
+		fmt.Fprintf(c.out, "  Need at least 7 days of data. Currently %d days.\n", stats.DaysRunning)
+		fmt.Fprintf(c.out, "  Keep running --paper and check back later.\n")
+	} else if stats.NetPnL > 0 && stats.DailyAvgPnL > 0 {
+		fmt.Fprintf(c.out, "  POSITIVE: Paper trading is net profitable.\n")
+		if stats.PartialFills == 0 || (float64(stats.PartialFills)/float64(stats.TotalFills+1) < 0.3) {
+			fmt.Fprintf(c.out, "  Partial fill risk is manageable (%.0f%%).\n",
+				float64(stats.PartialFills)/float64(stats.TotalFills+1)*100)
+			fmt.Fprintf(c.out, "  >>> READY to move to capital minimo ($25/side, 2 markets).\n")
+		} else {
+			fmt.Fprintf(c.out, "  WARNING: High partial fill rate. Consider longer observation.\n")
+		}
+	} else {
+		fmt.Fprintf(c.out, "  NEGATIVE: Paper trading is not profitable. Do NOT use real money yet.\n")
+		fmt.Fprintf(c.out, "  Review market selection and fill cost thresholds.\n")
+	}
+
+	fmt.Fprintln(c.out)
+}
