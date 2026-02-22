@@ -619,19 +619,24 @@ func (c *Console) PrintPaperReport(stats domain.PaperStats) {
 		fmt.Fprintf(c.out, "  Effective capital:     $%.2f (+%.2f%%)\n", effectiveCap, growth)
 		fmt.Fprintf(c.out, "  Compound balance:      $%.2f\n", stats.CompoundBalance)
 	}
-	if stats.AvgCycleHours > 0 {
-		fmt.Fprintf(c.out, "  Avg cycle time:        %.1f hours\n", stats.AvgCycleHours)
-		cyclesPerDay := 24.0 / stats.AvgCycleHours
-		fmt.Fprintf(c.out, "  Cycles/day (est):      %.1f\n", cyclesPerDay)
-		if stats.TotalRotations > 0 && stats.InitialCapital > 0 {
-			profitPerRotation := stats.TotalMergeProfit / float64(stats.TotalRotations)
+	if stats.TotalRotations > 0 && stats.InitialCapital > 0 {
+		profitPerRotation := stats.TotalMergeProfit / float64(stats.TotalRotations)
+		fmt.Fprintf(c.out, "  Profit/rotation:       $%.4f\n", profitPerRotation)
+
+		if stats.AvgCycleHours >= 1.0 {
+			fmt.Fprintf(c.out, "  Avg cycle time:        %.1f hours\n", stats.AvgCycleHours)
+			cyclesPerDay := 24.0 / stats.AvgCycleHours
+			fmt.Fprintf(c.out, "  Cycles/day (est):      %.1f\n", cyclesPerDay)
 			dailyReturn := profitPerRotation * cyclesPerDay / stats.InitialCapital
-			fmt.Fprintf(c.out, "  Profit/rotation:       $%.4f\n", profitPerRotation)
 			fmt.Fprintf(c.out, "  Est. daily return:     %.3f%%\n", dailyReturn*100)
-			monthly := stats.InitialCapital * math.Pow(1+dailyReturn, 30)
-			yearly := stats.InitialCapital * math.Pow(1+dailyReturn, 365)
-			fmt.Fprintf(c.out, "  Compound 30d:          $%.2f\n", monthly)
-			fmt.Fprintf(c.out, "  Compound 365d:         $%.2f\n", yearly)
+			if dailyReturn > 0 && dailyReturn < 1.0 {
+				monthly := stats.InitialCapital * math.Pow(1+dailyReturn, 30)
+				yearly := stats.InitialCapital * math.Pow(1+dailyReturn, 365)
+				fmt.Fprintf(c.out, "  Compound 30d:          $%.2f\n", monthly)
+				fmt.Fprintf(c.out, "  Compound 365d:         $%.2f\n", yearly)
+			}
+		} else {
+			fmt.Fprintf(c.out, "  Avg cycle time:        <1h (need more data for projections)\n")
 		}
 	}
 

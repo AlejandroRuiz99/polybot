@@ -13,13 +13,13 @@ import (
 )
 
 const (
-	paperMaxMarkets      = 3
+	paperMaxMarkets      = 10
 	paperMaxPartialHours = 6
-	paperNearEndHours    = 24   // expire orders when < 24h to resolution
+	paperNearEndHours    = 24
 	paperBidTickUp       = 0.01
-	paperDefaultCapital  = 200  // default initial capital for compound tracking
-	paperStaleHours      = 4    // cancel open pairs with no fills after this
-	paperMinOrderSize    = 10.0 // minimum order size for adaptive sizing
+	paperDefaultCapital  = 1000
+	paperStaleHours      = 4
+	paperMinOrderSize    = 10.0
 )
 
 // PaperConfig holds paper trading-specific settings.
@@ -186,16 +186,25 @@ func (pe *PaperEngine) RunOnce(ctx context.Context) (*PaperCycleResult, error) {
 			continue
 		}
 
-		// Strategy 2: competition-aware adaptive sizing
+		// Strategy 2: competition-aware adaptive sizing, capped to affordable amount
 		orderSize := pe.optimalOrderSize(opp)
-		orderCapital := orderSize * 2
-
-		if currentCapital+orderCapital > effectiveCapital {
-			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("compound capital limit: $%.0f deployed / $%.0f available (initial $%.0f + profit $%.2f)",
-					currentCapital, effectiveCapital, pe.cfg.InitialCapital, totalMergeProfit))
-			break
+		maxAffordable := (effectiveCapital - currentCapital) / 2
+		if orderSize > maxAffordable {
+			orderSize = maxAffordable
 		}
+		if orderSize < paperMinOrderSize {
+			if currentCapital == 0 {
+				// First order: use whatever we can afford
+				orderSize = maxAffordable
+			}
+			if orderSize < 1 {
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("compound capital limit: $%.0f deployed / $%.0f available (initial $%.0f + profit $%.2f)",
+						currentCapital, effectiveCapital, pe.cfg.InitialCapital, totalMergeProfit))
+				break
+			}
+		}
+		orderCapital := orderSize * 2
 
 		if err := pe.placeVirtualOrdersWithSize(ctx, opp, orderSize); err != nil {
 			slog.Warn("paper: error placing virtual orders",
@@ -522,15 +531,16 @@ func (pe *PaperEngine) checkFills(ctx context.Context) (int, error) {
 				continue
 			}
 
-			if err := pe.store.MarkPaperOrderFilled(ctx, order.ID, fillTrade.Timestamp, fillTrade.Price); err != nil {
+			// Maker limit orders fill at the BID price, not the taker's trade price
+			if err := pe.store.MarkPaperOrderFilled(ctx, order.ID, fillTrade.Timestamp, order.BidPrice); err != nil {
 				slog.Warn("paper: error marking order filled", "err", err)
 				continue
 			}
 			fill := domain.PaperFill{
 				OrderID:   order.ID,
 				TradeID:   fillTrade.ID,
-				Price:     fillTrade.Price,
-				Size:      fillTrade.Size,
+				Price:     order.BidPrice,
+				Size:      order.Size,
 				Timestamp: fillTrade.Timestamp,
 			}
 			if err := pe.store.SavePaperFill(ctx, fill); err != nil {
@@ -541,7 +551,7 @@ func (pe *PaperEngine) checkFills(ctx context.Context) (int, error) {
 				"side", order.Side,
 				"market", truncateStr(order.Question, 30),
 				"bidPrice", fmt.Sprintf("%.4f", order.BidPrice),
-				"fillPrice", fmt.Sprintf("%.4f", fillTrade.Price),
+				"triggerPrice", fmt.Sprintf("%.4f", fillTrade.Price),
 				"queueAhead", fmt.Sprintf("$%.0f", order.QueueAhead),
 				"sellVolNeeded", fmt.Sprintf("$%.0f", cumSellUSDC),
 			)
@@ -849,12 +859,13 @@ func (pe *PaperEngine) mergeCompletePairs(ctx context.Context) (merges int, tota
 			noPrice = no.BidPrice
 		}
 
+		// Spread = $1 - YES price - NO price (profit per merged share pair)
+		spread := 1.0 - yesPrice - noPrice
 		yesShares := yes.Size / yesPrice
 		noShares := no.Size / noPrice
 		mergeable := min(yesShares, noShares)
-		mergeReturn := mergeable * 1.0
-		capitalSpent := yes.Size + no.Size
-		profit := mergeReturn - capitalSpent
+		profit := mergeable * spread
+		capitalUsed := mergeable * (yesPrice + noPrice)
 
 		if err := pe.store.MarkPaperOrderMerged(ctx, yes.ID, now); err != nil {
 			slog.Warn("paper: error marking YES as merged", "err", err)
@@ -868,9 +879,10 @@ func (pe *PaperEngine) mergeCompletePairs(ctx context.Context) (merges int, tota
 		cycleTime := now.Sub(yes.PlacedAt)
 		slog.Info("paper: MERGED pair (compound rotation)",
 			"market", truncateStr(yes.Question, 30),
+			"spread", fmt.Sprintf("$%.4f", spread),
+			"shares", fmt.Sprintf("%.1f", mergeable),
 			"profit", fmt.Sprintf("$%.4f", profit),
-			"return", fmt.Sprintf("$%.2f", mergeReturn),
-			"spent", fmt.Sprintf("$%.2f", capitalSpent),
+			"capital_used", fmt.Sprintf("$%.2f", capitalUsed),
 			"cycle", fmt.Sprintf("%.1fh", cycleTime.Hours()),
 		)
 
@@ -919,12 +931,11 @@ func (pe *PaperEngine) getCompoundMetrics(ctx context.Context) (balance, totalPr
 			noPrice = no.BidPrice
 		}
 
+		spread := 1.0 - yesPrice - noPrice
 		yesShares := yes.Size / yesPrice
 		noShares := no.Size / noPrice
 		mergeable := min(yesShares, noShares)
-		mergeReturn := mergeable * 1.0
-		capitalSpent := yes.Size + no.Size
-		profit := mergeReturn - capitalSpent
+		profit := mergeable * spread
 
 		totalProfit += profit
 		rotations++
@@ -956,25 +967,22 @@ func (pe *PaperEngine) getCompoundMetrics(ctx context.Context) (balance, totalPr
 // Returns a fraction [0.1, 1.0] that grows as paper data confirms the edge.
 func (pe *PaperEngine) kellyFraction(ctx context.Context) float64 {
 	stats, err := pe.store.GetPaperStats(ctx)
-	if err != nil || stats.TotalOrders < 4 {
-		return 0.5 // not enough data → conservative half deployment
+	if err != nil || stats.TotalOrders < 50 {
+		return 1.0 // warmup: full deployment until we have ~5 full cycles of data
 	}
 
 	totalPairsAttempted := stats.TotalOrders / 2
 	if totalPairsAttempted == 0 {
-		return 0.5
+		return 1.0
 	}
 
-	// p = pair completion rate (completed + merged vs total attempted)
 	completed := stats.CompletePairs + stats.TotalRotations
 	p := float64(completed) / float64(totalPairsAttempted)
 
-	// If we have rotation data, compute Kelly from actual merge profits
-	if stats.TotalRotations > 0 && stats.TotalMergeProfit > 0 {
+	if stats.TotalRotations >= 5 && stats.TotalMergeProfit > 0 {
 		avgProfitPerRotation := stats.TotalMergeProfit / float64(stats.TotalRotations)
 		avgCapitalPerPair := 2 * pe.cfg.OrderSize
 
-		// b = profit ratio per completed pair
 		b := avgProfitPerRotation / avgCapitalPerPair
 		q := 1 - p
 
@@ -982,8 +990,8 @@ func (pe *PaperEngine) kellyFraction(ctx context.Context) float64 {
 			kelly := (p*b - q) / b
 			halfKelly := kelly / 2.0
 
-			if halfKelly < 0.1 {
-				halfKelly = 0.1
+			if halfKelly < 0.25 {
+				halfKelly = 0.25
 			}
 			if halfKelly > 1.0 {
 				halfKelly = 1.0
@@ -999,17 +1007,16 @@ func (pe *PaperEngine) kellyFraction(ctx context.Context) float64 {
 		}
 	}
 
-	// Fallback: use fill rate as confidence proxy
 	fillRate := float64(stats.TotalFills) / float64(max(stats.DaysRunning, 1))
 	switch {
 	case fillRate > 4:
-		return 0.9
+		return 1.0
 	case fillRate > 2:
-		return 0.7
+		return 0.9
 	case fillRate > 1:
-		return 0.6
+		return 0.8
 	default:
-		return 0.4
+		return 0.7
 	}
 }
 

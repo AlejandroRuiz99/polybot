@@ -30,10 +30,10 @@ backtest: build
 	./$(BUILD_DIR)/$(BINARY) --config config/config.yaml --backtest --verbose
 
 paper: build
-	./$(BUILD_DIR)/$(BINARY) --config config/config.yaml --paper --paper-capital 200 --verbose
+	./$(BUILD_DIR)/$(BINARY) --config config/config.yaml --paper --paper-capital 1000 --paper-markets 10 --verbose
 
 paper-report: build
-	./$(BUILD_DIR)/$(BINARY) --config config/config.yaml --paper-report --paper-capital 200
+	./$(BUILD_DIR)/$(BINARY) --config config/config.yaml --paper-report --paper-capital 1000
 
 clean:
 	rm -rf $(BUILD_DIR) coverage.out

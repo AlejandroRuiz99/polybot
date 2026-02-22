@@ -28,8 +28,8 @@ func main() {
 	backtest := flag.Bool("backtest", false, "scan once + fetch real trades to validate fill rates")
 	paper := flag.Bool("paper", false, "run paper trading simulation (no real money)")
 	paperReport := flag.Bool("paper-report", false, "print paper trading report and exit")
-	paperMarkets := flag.Int("paper-markets", 3, "max simultaneous markets in paper mode")
-	paperCapital := flag.Float64("paper-capital", 200, "initial capital for compound rotation tracking (USDC)")
+	paperMarkets := flag.Int("paper-markets", 10, "max simultaneous markets in paper mode")
+	paperCapital := flag.Float64("paper-capital", 1000, "initial capital for compound rotation tracking (USDC)")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)

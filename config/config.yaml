@@ -1,32 +1,22 @@
 scanner:
   interval_seconds: 30              # frecuencia de escaneo
-  order_size_usdc: 100              # tamaño hipotético de órdenes para scoring
+  order_size_usdc: 50               # $50/lado → $100/par → 10 mercados con $1000
 
-  # Fee para makers — Polymarket cobra 0% a makers en la mayoría de mercados.
-  # Solo los takers pagan fee. Como nosotros somos makers (limit orders), usamos 0%.
   fee_rate_default: 0.0             # 0% maker fee (Polymarket standard)
 
-  # Filtrar por tu ganancia real estimada
-  min_your_daily_reward: 0.0        # sin mínimo; sube a 0.01 para filtrar ruido
-
-  # Filtros adicionales
+  min_your_daily_reward: 0.0        # sin mínimo; la velocity score ya prioriza
   min_reward_score: 0.0
-  max_spread_total: 0.10            # safety net: spread máximo absoluto
-  max_competition: 5000             # USDC máximos de competencia en el book
+  max_spread_total: 0.10            # spread máximo absoluto
+  max_competition: 5000             # evitar mercados hipersaturados
   require_qualifies: true           # solo mercados que califican para reward
 
-  # Ignorar mercados que se resuelven pronto (0 = sin filtro)
-  min_hours_to_resolution: 48       # ignorar mercados con < 48h hasta resolución
+  min_hours_to_resolution: 24       # 24h mínimo (reducido para más opciones de rotación)
 
-  # SEGURIDAD: solo operar mercados donde los fills son gratis o rentables
-  only_fills_profit: true           # true = descartar mercados con Fill$ > 0 (tóxicos)
+  only_fills_profit: true           # SEGURIDAD: solo FILLS=PROFIT (YES+NO < $1)
 
-  # Arbitraje + concurrencia
-  arb_fills_per_day: 2.0            # fills estimados/día para cálculo de P&L de fills
-  gold_min_reward: 0.01             # mínimo reward/día para aparecer como Gold/Silver
-                                    # (Gold = fills < 2% coste, Silver = fills 2-5%)
-                                    # sube a 0.05 o 0.10 para filtrar mercados pequeños
-  analysis_workers: 0               # 0 = auto (NumCPU*2 goroutines para análisis paralelo)
+  arb_fills_per_day: 2.0
+  gold_min_reward: 0.01
+  analysis_workers: 0               # auto (NumCPU*2)
 
 api:
   clob_base: "https://clob.polymarket.com"
