@@ -2,8 +2,9 @@ scanner:
   interval_seconds: 30              # frecuencia de escaneo
   order_size_usdc: 100              # tamaño hipotético de órdenes para scoring
 
-  # Fee conservador si el mercado no devuelve su fee real
-  fee_rate_default: 0.02            # 2% — ajustar si conoces los fees reales
+  # Fee para makers — Polymarket cobra 0% a makers en la mayoría de mercados.
+  # Solo los takers pagan fee. Como nosotros somos makers (limit orders), usamos 0%.
+  fee_rate_default: 0.0             # 0% maker fee (Polymarket standard)
 
   # Filtrar por tu ganancia real estimada
   min_your_daily_reward: 0.0        # sin mínimo; sube a 0.01 para filtrar ruido

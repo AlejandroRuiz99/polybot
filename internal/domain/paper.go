@@ -10,6 +10,7 @@ const (
 	PaperStatusFilled    PaperOrderStatus = "FILLED"
 	PaperStatusExpired   PaperOrderStatus = "EXPIRED"
 	PaperStatusCancelled PaperOrderStatus = "CANCELLED"
+	PaperStatusResolved  PaperOrderStatus = "RESOLVED"
 )
 
 // VirtualOrder is a simulated order the bot would have placed.
@@ -27,6 +28,8 @@ type VirtualOrder struct {
 	PairID       string // links YES+NO orders for the same market
 	Question     string
 	QueueAhead   float64 // estimated USDC ahead in the book at placement time
+	DailyReward  float64 // estimated daily reward at placement time
+	EndDate      time.Time
 }
 
 // PaperFill records when a real trade would have filled a virtual order.
@@ -41,21 +44,25 @@ type PaperFill struct {
 
 // PaperPosition is the current state of a simulated position in a market.
 type PaperPosition struct {
-	ConditionID  string
-	PairID       string
-	Question     string
-	YesOrder     *VirtualOrder
-	NoOrder      *VirtualOrder
-	YesFilled    bool
-	NoFilled     bool
-	IsComplete   bool       // both sides filled
-	PartialSince *time.Time // how long only one side has been filled
-	FillCostPair float64
-	DailyReward  float64
+	ConditionID      string
+	PairID           string
+	Question         string
+	YesOrder         *VirtualOrder
+	NoOrder          *VirtualOrder
+	YesFilled        bool
+	NoFilled         bool
+	IsComplete       bool       // both sides filled
+	IsResolved       bool       // market has resolved
+	PartialSince     *time.Time // how long only one side has been filled
+	FillCostPair     float64
+	DailyReward      float64
+	RewardAccrued    float64 // total reward earned while orders were active
+	SpreadQualifies  bool    // whether current spread qualifies for rewards
+	HoursToEnd       float64 // hours remaining until market resolution
+	CapitalDeployed  float64 // total USDC locked in this position
 }
 
 // PartialDuration returns how long the position has been partially filled.
-// Returns 0 if the position is not partial.
 func (p PaperPosition) PartialDuration() time.Duration {
 	if p.PartialSince == nil || p.IsComplete {
 		return 0
@@ -76,6 +83,9 @@ type PaperDailySummary struct {
 	FillsYes         int
 	FillsNo          int
 	OrdersPlaced     int
+	CapitalDeployed  float64
+	MarketsResolved  int
+	ResolutionPnL    float64
 }
 
 // PaperStats is the aggregate statistics across the entire paper trading run.
@@ -93,7 +103,10 @@ type PaperStats struct {
 	TotalFillPnL     float64
 	NetPnL           float64
 	DailyAvgPnL      float64
-	FillRateReal     float64 // observed fills/day
+	FillRateReal     float64
 	MarketsMonitored int
+	MarketsResolved  int
+	ResolutionPnL    float64
+	MaxCapital       float64
 	Dailies          []PaperDailySummary
 }

@@ -200,7 +200,14 @@ func runPaperCycle(ctx context.Context, pe *scanner.PaperEngine, notifier *notif
 		return
 	}
 
-	notifier.PrintPaperStatus(result.Positions, result.NewOrders, result.NewFills, result.PartialAlerts)
+	notifier.PrintPaperStatus(notify.PaperStatusInput{
+		Positions:       result.Positions,
+		NewOrders:       result.NewOrders,
+		NewFills:        result.NewFills,
+		Alerts:          result.PartialAlerts,
+		Warnings:        result.Warnings,
+		CapitalDeployed: result.CapitalDeployed,
+	})
 }
 
 func runPaperReport(ctx context.Context, store *storage.SQLiteStorage, notifier *notify.Console) {

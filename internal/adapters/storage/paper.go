@@ -23,7 +23,9 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     filled_at     DATETIME,
     filled_price  REAL NOT NULL DEFAULT 0,
     question      TEXT,
-    queue_ahead   REAL NOT NULL DEFAULT 0
+    queue_ahead   REAL NOT NULL DEFAULT 0,
+    daily_reward  REAL NOT NULL DEFAULT 0,
+    end_date      DATETIME
 );
 
 CREATE TABLE IF NOT EXISTS paper_fills (
@@ -46,7 +48,10 @@ CREATE TABLE IF NOT EXISTS paper_daily (
     avg_partial_mins  REAL NOT NULL DEFAULT 0,
     fills_yes         INTEGER NOT NULL DEFAULT 0,
     fills_no          INTEGER NOT NULL DEFAULT 0,
-    orders_placed     INTEGER NOT NULL DEFAULT 0
+    orders_placed     INTEGER NOT NULL DEFAULT 0,
+    capital_deployed  REAL NOT NULL DEFAULT 0,
+    markets_resolved  INTEGER NOT NULL DEFAULT 0,
+    resolution_pnl    REAL NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_paper_orders_pair   ON paper_orders(pair_id);
@@ -55,25 +60,49 @@ CREATE INDEX IF NOT EXISTS idx_paper_orders_cond   ON paper_orders(condition_id)
 CREATE INDEX IF NOT EXISTS idx_paper_fills_order   ON paper_fills(order_id);
 `
 
+// migrate adds columns that may not exist in older schemas.
+const paperMigrations = `
+ALTER TABLE paper_orders ADD COLUMN daily_reward REAL NOT NULL DEFAULT 0;
+ALTER TABLE paper_orders ADD COLUMN end_date DATETIME;
+ALTER TABLE paper_daily ADD COLUMN capital_deployed REAL NOT NULL DEFAULT 0;
+ALTER TABLE paper_daily ADD COLUMN markets_resolved INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE paper_daily ADD COLUMN resolution_pnl REAL NOT NULL DEFAULT 0;
+`
+
 // ApplyPaperSchema creates paper trading tables if they don't exist.
 func (s *SQLiteStorage) ApplyPaperSchema(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, paperSchema)
-	if err != nil {
+	if _, err := s.db.ExecContext(ctx, paperSchema); err != nil {
 		return fmt.Errorf("storage.ApplyPaperSchema: %w", err)
+	}
+	// Run migrations silently — they fail if columns already exist, which is fine
+	for _, stmt := range []string{
+		"ALTER TABLE paper_orders ADD COLUMN daily_reward REAL NOT NULL DEFAULT 0",
+		"ALTER TABLE paper_orders ADD COLUMN end_date DATETIME",
+		"ALTER TABLE paper_daily ADD COLUMN capital_deployed REAL NOT NULL DEFAULT 0",
+		"ALTER TABLE paper_daily ADD COLUMN markets_resolved INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE paper_daily ADD COLUMN resolution_pnl REAL NOT NULL DEFAULT 0",
+	} {
+		s.db.ExecContext(ctx, stmt) // ignore errors (column already exists)
 	}
 	return nil
 }
 
 // SavePaperOrder inserts a new virtual order.
 func (s *SQLiteStorage) SavePaperOrder(ctx context.Context, order domain.VirtualOrder) error {
+	var endDate *string
+	if !order.EndDate.IsZero() {
+		t := order.EndDate.UTC().Format(time.RFC3339)
+		endDate = &t
+	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO paper_orders (id, condition_id, token_id, side, bid_price, size,
 		                          pair_id, placed_at, status, filled_at, filled_price,
-		                          question, queue_ahead)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                          question, queue_ahead, daily_reward, end_date)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		order.ID, order.ConditionID, order.TokenID, order.Side, order.BidPrice,
-		order.Size, order.PairID, order.PlacedAt.UTC(), string(order.Status),
-		nil, order.FilledPrice, order.Question, order.QueueAhead,
+		order.Size, order.PairID, order.PlacedAt.UTC().Format(time.RFC3339),
+		string(order.Status), nil, order.FilledPrice, order.Question,
+		order.QueueAhead, order.DailyReward, endDate,
 	)
 	if err != nil {
 		return fmt.Errorf("storage.SavePaperOrder: %w", err)
@@ -86,10 +115,31 @@ func (s *SQLiteStorage) MarkPaperOrderFilled(ctx context.Context, orderID string
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE paper_orders SET status = 'FILLED', filled_at = ?, filled_price = ?
 		WHERE id = ?`,
-		filledAt.UTC(), filledPrice, orderID,
+		filledAt.UTC().Format(time.RFC3339), filledPrice, orderID,
 	)
 	if err != nil {
 		return fmt.Errorf("storage.MarkPaperOrderFilled: %w", err)
+	}
+	return nil
+}
+
+// MarkPaperOrderResolved marks an order as resolved (market ended).
+func (s *SQLiteStorage) MarkPaperOrderResolved(ctx context.Context, orderID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE paper_orders SET status = 'RESOLVED' WHERE id = ?`, orderID)
+	if err != nil {
+		return fmt.Errorf("storage.MarkPaperOrderResolved: %w", err)
+	}
+	return nil
+}
+
+// UpdatePaperOrderQueue updates the queue position for an open order.
+func (s *SQLiteStorage) UpdatePaperOrderQueue(ctx context.Context, orderID string, queueAhead float64) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE paper_orders SET queue_ahead = ? WHERE id = ? AND status = 'OPEN'`,
+		queueAhead, orderID)
+	if err != nil {
+		return fmt.Errorf("storage.UpdatePaperOrderQueue: %w", err)
 	}
 	return nil
 }
@@ -112,7 +162,7 @@ func (s *SQLiteStorage) SavePaperFill(ctx context.Context, fill domain.PaperFill
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO paper_fills (order_id, trade_id, price, size, timestamp)
 		VALUES (?, ?, ?, ?, ?)`,
-		fill.OrderID, fill.TradeID, fill.Price, fill.Size, fill.Timestamp.UTC(),
+		fill.OrderID, fill.TradeID, fill.Price, fill.Size, fill.Timestamp.UTC().Format(time.RFC3339),
 	)
 	if err != nil {
 		return fmt.Errorf("storage.SavePaperFill: %w", err)
@@ -124,7 +174,8 @@ func (s *SQLiteStorage) SavePaperFill(ctx context.Context, fill domain.PaperFill
 func (s *SQLiteStorage) GetOpenPaperOrders(ctx context.Context) ([]domain.VirtualOrder, error) {
 	return s.queryPaperOrders(ctx, `
 		SELECT id, condition_id, token_id, side, bid_price, size,
-		       pair_id, placed_at, status, filled_at, filled_price, question, queue_ahead
+		       pair_id, placed_at, status, filled_at, filled_price, question,
+		       queue_ahead, daily_reward, end_date
 		FROM paper_orders WHERE status = 'OPEN'
 		ORDER BY placed_at DESC`)
 }
@@ -133,7 +184,8 @@ func (s *SQLiteStorage) GetOpenPaperOrders(ctx context.Context) ([]domain.Virtua
 func (s *SQLiteStorage) GetPaperOrdersByPair(ctx context.Context, pairID string) ([]domain.VirtualOrder, error) {
 	return s.queryPaperOrders(ctx, `
 		SELECT id, condition_id, token_id, side, bid_price, size,
-		       pair_id, placed_at, status, filled_at, filled_price, question, queue_ahead
+		       pair_id, placed_at, status, filled_at, filled_price, question,
+		       queue_ahead, daily_reward, end_date
 		FROM paper_orders WHERE pair_id = ?
 		ORDER BY side`, pairID)
 }
@@ -163,13 +215,15 @@ func (s *SQLiteStorage) GetAllPaperOrders(ctx context.Context, status string) ([
 	if status != "" {
 		return s.queryPaperOrders(ctx, `
 			SELECT id, condition_id, token_id, side, bid_price, size,
-			       pair_id, placed_at, status, filled_at, filled_price, question, queue_ahead
+			       pair_id, placed_at, status, filled_at, filled_price, question,
+			       queue_ahead, daily_reward, end_date
 			FROM paper_orders WHERE status = ?
 			ORDER BY placed_at DESC`, status)
 	}
 	return s.queryPaperOrders(ctx, `
 		SELECT id, condition_id, token_id, side, bid_price, size,
-		       pair_id, placed_at, status, filled_at, filled_price, question, queue_ahead
+		       pair_id, placed_at, status, filled_at, filled_price, question,
+		       queue_ahead, daily_reward, end_date
 		FROM paper_orders ORDER BY placed_at DESC`)
 }
 
@@ -178,8 +232,9 @@ func (s *SQLiteStorage) SavePaperDaily(ctx context.Context, d domain.PaperDailyS
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO paper_daily (date, active_positions, complete_pairs, partial_fills,
 		                         total_reward, total_fill_pnl, net_pnl, avg_partial_mins,
-		                         fills_yes, fills_no, orders_placed)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                         fills_yes, fills_no, orders_placed, capital_deployed,
+		                         markets_resolved, resolution_pnl)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(date) DO UPDATE SET
 		    active_positions = excluded.active_positions,
 		    complete_pairs   = excluded.complete_pairs,
@@ -190,10 +245,14 @@ func (s *SQLiteStorage) SavePaperDaily(ctx context.Context, d domain.PaperDailyS
 		    avg_partial_mins = excluded.avg_partial_mins,
 		    fills_yes        = excluded.fills_yes,
 		    fills_no         = excluded.fills_no,
-		    orders_placed    = excluded.orders_placed`,
+		    orders_placed    = excluded.orders_placed,
+		    capital_deployed = excluded.capital_deployed,
+		    markets_resolved = excluded.markets_resolved,
+		    resolution_pnl   = excluded.resolution_pnl`,
 		d.Date.UTC().Format("2006-01-02"), d.ActivePositions, d.CompletePairs,
 		d.PartialFills, d.TotalReward, d.TotalFillPnL, d.NetPnL,
 		d.AvgPartialMins, d.FillsYes, d.FillsNo, d.OrdersPlaced,
+		d.CapitalDeployed, d.MarketsResolved, d.ResolutionPnL,
 	)
 	if err != nil {
 		return fmt.Errorf("storage.SavePaperDaily: %w", err)
@@ -206,7 +265,8 @@ func (s *SQLiteStorage) GetPaperDailies(ctx context.Context) ([]domain.PaperDail
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT date, active_positions, complete_pairs, partial_fills,
 		       total_reward, total_fill_pnl, net_pnl, avg_partial_mins,
-		       fills_yes, fills_no, orders_placed
+		       fills_yes, fills_no, orders_placed, capital_deployed,
+		       markets_resolved, resolution_pnl
 		FROM paper_daily ORDER BY date ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("storage.GetPaperDailies: %w", err)
@@ -220,11 +280,11 @@ func (s *SQLiteStorage) GetPaperDailies(ctx context.Context) ([]domain.PaperDail
 		if err := rows.Scan(
 			&dateStr, &d.ActivePositions, &d.CompletePairs, &d.PartialFills,
 			&d.TotalReward, &d.TotalFillPnL, &d.NetPnL, &d.AvgPartialMins,
-			&d.FillsYes, &d.FillsNo, &d.OrdersPlaced,
+			&d.FillsYes, &d.FillsNo, &d.OrdersPlaced, &d.CapitalDeployed,
+			&d.MarketsResolved, &d.ResolutionPnL,
 		); err != nil {
 			return nil, fmt.Errorf("storage.GetPaperDailies: scan: %w", err)
 		}
-		// SQLite may return date with or without time component
 		if len(dateStr) > 10 {
 			dateStr = dateStr[:10]
 		}
@@ -258,6 +318,11 @@ func (s *SQLiteStorage) GetPaperStats(ctx context.Context) (domain.PaperStats, e
 		stats.NetPnL += d.NetPnL
 		stats.TotalFills += d.FillsYes + d.FillsNo
 		stats.TotalOrders += d.OrdersPlaced
+		stats.MarketsResolved += d.MarketsResolved
+		stats.ResolutionPnL += d.ResolutionPnL
+		if d.CapitalDeployed > stats.MaxCapital {
+			stats.MaxCapital = d.CapitalDeployed
+		}
 	}
 
 	if stats.DaysRunning > 0 {
@@ -265,7 +330,6 @@ func (s *SQLiteStorage) GetPaperStats(ctx context.Context) (domain.PaperStats, e
 		stats.FillRateReal = float64(stats.TotalFills) / float64(stats.DaysRunning)
 	}
 
-	// Max partial duration from paper_orders
 	var maxPartial sql.NullFloat64
 	_ = s.db.QueryRowContext(ctx, `
 		SELECT MAX(avg_partial_mins) FROM paper_daily`).Scan(&maxPartial)
@@ -273,7 +337,6 @@ func (s *SQLiteStorage) GetPaperStats(ctx context.Context) (domain.PaperStats, e
 		stats.MaxPartialMins = maxPartial.Float64
 	}
 
-	// Distinct markets monitored
 	var markets int
 	_ = s.db.QueryRowContext(ctx, `
 		SELECT COUNT(DISTINCT condition_id) FROM paper_orders`).Scan(&markets)
@@ -294,13 +357,12 @@ func (s *SQLiteStorage) queryPaperOrders(ctx context.Context, query string, args
 	for rows.Next() {
 		var o domain.VirtualOrder
 		var status, placedAt string
-		var filledAt sql.NullString
-		var question sql.NullString
+		var filledAt, question, endDate sql.NullString
 
 		if err := rows.Scan(
 			&o.ID, &o.ConditionID, &o.TokenID, &o.Side, &o.BidPrice, &o.Size,
 			&o.PairID, &placedAt, &status, &filledAt, &o.FilledPrice,
-			&question, &o.QueueAhead,
+			&question, &o.QueueAhead, &o.DailyReward, &endDate,
 		); err != nil {
 			return nil, fmt.Errorf("storage.queryPaperOrders: scan: %w", err)
 		}
@@ -313,6 +375,9 @@ func (s *SQLiteStorage) queryPaperOrders(ctx context.Context, query string, args
 		if filledAt.Valid {
 			t, _ := time.Parse(time.RFC3339, filledAt.String)
 			o.FilledAt = &t
+		}
+		if endDate.Valid {
+			o.EndDate, _ = time.Parse(time.RFC3339, endDate.String)
 		}
 
 		out = append(out, o)
