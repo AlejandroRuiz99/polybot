@@ -1,0 +1,21 @@
+# Binaries
+bin/
+polybot
+*.exe
+
+# Config con secrets
+.env
+
+# Base de datos local
+*.db
+*.sqlite
+
+# Build artifacts
+dist/
+
+# Go
+vendor/
+
+# IDE
+.idea/
+*.swp

@@ -1,0 +1,48 @@
+---
+description: Reglas para implementar estrategias de reward farming en Polybot
+globs: internal/strategy/**
+alwaysApply: false
+---
+
+# Strategy — Reward Farming
+
+## Fórmula de scoring
+```
+S = ((v - s) / v)² × b
+```
+- `v` = tamaño de nuestras órdenes hipotéticas (en USDC)
+- `s` = spread total del mercado (`best_ask_YES + best_ask_NO - 1.0`)
+- `b` = reward rate diario del mercado (USDC/día)
+
+**Implementación en `domain/scoring.go`** — función pura, sin dependencias externas:
+```go
+func RewardScore(orderSize, spread, rewardRate float64) float64 {
+    if orderSize <= 0 || spread <= 0 {
+        return 0
+    }
+    ratio := (orderSize - spread) / orderSize
+    return ratio * ratio * rewardRate
+}
+```
+
+## Métricas clave por mercado
+- `spread_total` = best_ask_YES + best_ask_NO - 1.0 (si < 0 → arbitraje)
+- `reward_rate` = USDC/día disponibles (`market.rewards.rates`)
+- `max_spread` = spread máximo para calificar al reward
+- `competition` = profundidad del book dentro del `max_spread`
+- `net_profit_est` = reward_estimate - fees - spread_cost
+
+## Interface Strategy
+```go
+type Strategy interface {
+    Name() string
+    Analyze(ctx context.Context, market domain.Market, book domain.OrderBook) (domain.Opportunity, error)
+    Filter(opp domain.Opportunity) bool
+}
+```
+
+## Reglas de negocio
+- Descartar mercados donde `spread_total >= max_spread`.
+- Descartar mercados con `competition` muy alta (configurable).
+- Ordenar oportunidades por `estimated_score` descendente.
+- `net_profit_est` debe ser positivo tras descontar fees estimados (0.1% Polymarket).

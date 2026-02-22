@@ -1,0 +1,37 @@
+{
+  "limit": 100,
+  "count": 2,
+  "next_cursor": "LTE=",
+  "data": [
+    {
+      "condition_id": "0xabc123",
+      "question_id": "0xq001",
+      "tokens": [
+        { "token_id": "token_yes_001", "outcome": "Yes", "price": 0.72, "winner": false },
+        { "token_id": "token_no_001",  "outcome": "No",  "price": 0.28, "winner": false }
+      ],
+      "rewards": {
+        "rates": [{ "asset_address": "0xusdc", "rewards_daily_rate": 25.5 }],
+        "min_size": 10.0,
+        "max_spread": 0.04
+      },
+      "active": true,
+      "closed": false
+    },
+    {
+      "condition_id": "0xdef456",
+      "question_id": "0xq002",
+      "tokens": [
+        { "token_id": "token_yes_002", "outcome": "Yes", "price": 0.50, "winner": false },
+        { "token_id": "token_no_002",  "outcome": "No",  "price": 0.50, "winner": false }
+      ],
+      "rewards": {
+        "rates": [{ "asset_address": "0xusdc", "rewards_daily_rate": 100.0 }],
+        "min_size": 25.0,
+        "max_spread": 0.02
+      },
+      "active": true,
+      "closed": false
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+---
+description: Convenciones generales Go para Polybot — naming, errores, logging, context
+alwaysApply: true
+---
+
+# Polybot — Convenciones Go
+
+## Versión y stdlib
+- Go 1.23. Usa `log/slog` para todo logging (nunca `fmt.Println` en producción).
+- Propaga siempre `context.Context` como primer argumento en funciones que hacen I/O.
+
+## Arquitectura hexagonal
+```
+cmd/scanner/        → entrypoint, wiring de dependencias
+internal/domain/    → entidades puras, cero imports externos
+internal/ports/     → interfaces (contratos entre capas)
+internal/adapters/  → implementaciones concretas (HTTP, SQLite, consola)
+internal/scanner/   → orquestador + analyzer + filter
+internal/strategy/  → lógica de reward farming
+config/             → carga YAML + .env
+```
+**Regla:** el dominio NO importa adapters ni ports. Los adapters importan ports. El scanner importa ports y domain.
+
+## Naming
+- Interfaces con sustantivo: `MarketProvider`, `BookProvider`, `Notifier`.
+- Constructores: `NewXxx(deps...) (*Xxx, error)`.
+- Errores con contexto: `fmt.Errorf("clob.GetSamplingMarkets: %w", err)`.
+
+## Error handling
+```go
+// ❌ MAL
+if err != nil { return err }
+
+// ✅ BIEN — siempre wrappear con contexto
+if err != nil {
+    return fmt.Errorf("scanner.Run: fetch markets: %w", err)
+}
+```
+
+## Logging con slog
+```go
+slog.Info("scan cycle complete", "markets", len(markets), "opportunities", len(opps))
+slog.Error("fetch failed", "err", err, "retry", attempt)
+```
+
+## Gestión de contexto (ventana de contexto)
+- Cuando un archivo supera ~300 líneas, dividir en sub-archivos cohesivos.
+- Cada archivo debe tener un único propósito expresado en su nombre.
+- Los tests viven en `_test.go` en el mismo paquete (white-box) o paquete `_test` (black-box).
