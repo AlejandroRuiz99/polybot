@@ -15,16 +15,19 @@ import (
 const (
 	paperMaxMarkets      = 3
 	paperMaxPartialHours = 6
-	paperNearEndHours    = 24 // expire orders when < 24h to resolution
+	paperNearEndHours    = 24   // expire orders when < 24h to resolution
 	paperBidTickUp       = 0.01
-	paperMaxCapitalTotal = 2000 // hard cap: never deploy more than this
+	paperDefaultCapital  = 200  // default initial capital for compound tracking
+	paperStaleHours      = 4    // cancel open pairs with no fills after this
+	paperMinOrderSize    = 10.0 // minimum order size for adaptive sizing
 )
 
 // PaperConfig holds paper trading-specific settings.
 type PaperConfig struct {
-	OrderSize  float64
-	MaxMarkets int
-	FeeRate    float64
+	OrderSize      float64
+	MaxMarkets     int
+	FeeRate        float64
+	InitialCapital float64
 }
 
 // PaperEngine runs the paper trading simulation loop.
@@ -46,6 +49,9 @@ func NewPaperEngine(
 	if cfg.MaxMarkets <= 0 {
 		cfg.MaxMarkets = paperMaxMarkets
 	}
+	if cfg.InitialCapital <= 0 {
+		cfg.InitialCapital = paperDefaultCapital
+	}
 	return &PaperEngine{
 		scanner:  scanner,
 		trades:   trades,
@@ -66,6 +72,12 @@ type PaperCycleResult struct {
 	CapitalDeployed float64
 	TotalReward     float64
 	MarketsResolved int
+	Merges          int
+	MergeProfit     float64
+	CompoundBalance float64
+	TotalRotations  int
+	AvgCycleHours   float64
+	KellyFraction   float64
 }
 
 // RunOnce executes a single paper trading cycle with all gap fixes.
@@ -91,6 +103,12 @@ func (pe *PaperEngine) RunOnce(ctx context.Context) (*PaperCycleResult, error) {
 	// 3. Refresh queue positions with current book data (GAP #4)
 	pe.refreshQueues(ctx, oppByCondition)
 
+	// 3.5. Strategy 6: rotate stale orders (both sides OPEN >4h → free capital)
+	staleExpired := pe.rotateStaleOrders(ctx)
+	if staleExpired > 0 {
+		slog.Info("paper: rotated stale orders", "pairs_freed", staleExpired)
+	}
+
 	// 4. Check fills on existing open orders (with queue-adjusted logic)
 	fills, err := pe.checkFills(ctx)
 	if err != nil {
@@ -98,7 +116,21 @@ func (pe *PaperEngine) RunOnce(ctx context.Context) (*PaperCycleResult, error) {
 	}
 	result.NewFills = fills
 
-	// 5. Place new orders — with bid optimization (GAP #7, #8) and capital tracking (GAP #9)
+	// 4.5. Merge complete pairs → compound rotation
+	merges, mergeProfit, err := pe.mergeCompletePairs(ctx)
+	if err != nil {
+		slog.Warn("paper: error merging pairs", "err", err)
+	}
+	result.Merges = merges
+	result.MergeProfit = mergeProfit
+
+	// Compute compound balance (initial + all merge returns - deployed)
+	compoundBalance, totalMergeProfit, totalRotations, avgCycleHours := pe.getCompoundMetrics(ctx)
+	result.CompoundBalance = compoundBalance
+	result.TotalRotations = totalRotations
+	result.AvgCycleHours = avgCycleHours
+
+	// 5. Place new orders — with bid optimization and compound capital tracking
 	activeConditions, err := pe.store.GetActivePaperConditions(ctx)
 	if err != nil {
 		slog.Warn("paper: error getting active conditions", "err", err)
@@ -109,9 +141,28 @@ func (pe *PaperEngine) RunOnce(ctx context.Context) (*PaperCycleResult, error) {
 		activeSet[c] = true
 	}
 
-	// Calculate current capital deployed (GAP #9)
 	currentCapital := pe.calculateDeployedCapital(ctx)
 	result.CapitalDeployed = currentCapital
+
+	// Strategy 9: Kelly Criterion — determines max deployable fraction of bankroll
+	// With little data: conservative (50%). As fills confirm: deploy more.
+	kellyF := pe.kellyFraction(ctx)
+	result.KellyFraction = kellyF
+	bankroll := pe.cfg.InitialCapital + totalMergeProfit
+	effectiveCapital := bankroll * kellyF
+
+	slog.Debug("paper: Kelly capital allocation",
+		"bankroll", fmt.Sprintf("$%.2f", bankroll),
+		"kelly_f", fmt.Sprintf("%.0f%%", kellyF*100),
+		"deployable", fmt.Sprintf("$%.2f", effectiveCapital),
+		"deployed", fmt.Sprintf("$%.2f", currentCapital),
+	)
+
+	// Strategy 4+6: sort opportunities by compound velocity score
+	// (shorter queues + higher profit per pair = faster compound cycles)
+	sort.Slice(opps, func(i, j int) bool {
+		return compoundVelocityScore(opps[i]) > compoundVelocityScore(opps[j])
+	})
 
 	newOrders := 0
 	for _, opp := range opps {
@@ -121,31 +172,32 @@ func (pe *PaperEngine) RunOnce(ctx context.Context) (*PaperCycleResult, error) {
 		if activeSet[opp.Market.ConditionID] {
 			continue
 		}
-		// Only FILLS=PROFIT markets (with 0% maker fee, this is yesP + noP < 1.0)
 		if opp.FillCostPerPair > 0 {
 			continue
 		}
 		if opp.YourDailyReward <= 0 {
 			continue
 		}
-		// GAP #7: skip markets too close to resolution
 		hoursLeft := opp.Market.HoursToResolution()
 		if hoursLeft > 0 && hoursLeft < paperNearEndHours {
 			continue
 		}
-		// GAP #5: skip if spread doesn't qualify for rewards
 		if !opp.QualifiesReward {
 			continue
 		}
-		// GAP #9: capital limit
-		orderCapital := pe.cfg.OrderSize * 2
-		if currentCapital+orderCapital > paperMaxCapitalTotal {
+
+		// Strategy 2: competition-aware adaptive sizing
+		orderSize := pe.optimalOrderSize(opp)
+		orderCapital := orderSize * 2
+
+		if currentCapital+orderCapital > effectiveCapital {
 			result.Warnings = append(result.Warnings,
-				fmt.Sprintf("capital limit reached: $%.0f/$%.0f", currentCapital, float64(paperMaxCapitalTotal)))
+				fmt.Sprintf("compound capital limit: $%.0f deployed / $%.0f available (initial $%.0f + profit $%.2f)",
+					currentCapital, effectiveCapital, pe.cfg.InitialCapital, totalMergeProfit))
 			break
 		}
 
-		if err := pe.placeVirtualOrders(ctx, opp); err != nil {
+		if err := pe.placeVirtualOrdersWithSize(ctx, opp, orderSize); err != nil {
 			slog.Warn("paper: error placing virtual orders",
 				"market", opp.Market.Question, "err", err)
 			continue
@@ -206,8 +258,13 @@ func (pe *PaperEngine) RunOnce(ctx context.Context) (*PaperCycleResult, error) {
 	return result, nil
 }
 
-// placeVirtualOrders creates a YES+NO order pair with bid optimization (GAP #8).
+// placeVirtualOrders creates a YES+NO order pair with default config size.
 func (pe *PaperEngine) placeVirtualOrders(ctx context.Context, opp domain.Opportunity) error {
+	return pe.placeVirtualOrdersWithSize(ctx, opp, pe.cfg.OrderSize)
+}
+
+// placeVirtualOrdersWithSize creates a YES+NO order pair with bid optimization and adaptive sizing.
+func (pe *PaperEngine) placeVirtualOrdersWithSize(ctx context.Context, opp domain.Opportunity, orderSize float64) error {
 	pairID := uuid.New().String()
 	now := time.Now().UTC()
 
@@ -223,19 +280,17 @@ func (pe *PaperEngine) placeVirtualOrders(ctx context.Context, opp domain.Opport
 	yesQueue := queuePosition(opp.YesBook, yesBid)
 	noQueue := queuePosition(opp.NoBook, noBid)
 
-	// GAP #8: Bid optimization — if queue is large, bid 1 tick higher
-	// to get to front of queue, but only if FILLS=PROFIT is maintained.
 	yesBidOpt, noBidOpt := yesBid, noBid
 	optimized := false
-	if yesQueue > pe.cfg.OrderSize {
+	if yesQueue > orderSize {
 		candidate := yesBid + paperBidTickUp
 		if domain.FillCostPerEvent(candidate, noBid, pe.cfg.FeeRate) <= 0 {
 			yesBidOpt = candidate
-			yesQueue = 0 // front of new price level
+			yesQueue = 0
 			optimized = true
 		}
 	}
-	if noQueue > pe.cfg.OrderSize {
+	if noQueue > orderSize {
 		candidate := noBid + paperBidTickUp
 		if domain.FillCostPerEvent(yesBidOpt, candidate, pe.cfg.FeeRate) <= 0 {
 			noBidOpt = candidate
@@ -250,7 +305,7 @@ func (pe *PaperEngine) placeVirtualOrders(ctx context.Context, opp domain.Opport
 		TokenID:     opp.Market.YesToken().TokenID,
 		Side:        "YES",
 		BidPrice:    yesBidOpt,
-		Size:        pe.cfg.OrderSize,
+		Size:        orderSize,
 		PlacedAt:    now,
 		Status:      domain.PaperStatusOpen,
 		PairID:      pairID,
@@ -266,7 +321,7 @@ func (pe *PaperEngine) placeVirtualOrders(ctx context.Context, opp domain.Opport
 		TokenID:     opp.Market.NoToken().TokenID,
 		Side:        "NO",
 		BidPrice:    noBidOpt,
-		Size:        pe.cfg.OrderSize,
+		Size:        orderSize,
 		PlacedAt:    now,
 		Status:      domain.PaperStatusOpen,
 		PairID:      pairID,
@@ -287,10 +342,15 @@ func (pe *PaperEngine) placeVirtualOrders(ctx context.Context, opp domain.Opport
 	if optimized {
 		optLabel = " [BID OPTIMIZED +1c]"
 	}
-	slog.Info("paper: placed virtual orders"+optLabel,
+	sizeLabel := ""
+	if orderSize != pe.cfg.OrderSize {
+		sizeLabel = fmt.Sprintf(" [ADAPTIVE $%.0f]", orderSize)
+	}
+	slog.Info("paper: placed virtual orders"+optLabel+sizeLabel,
 		"market", truncateStr(opp.Market.Question, 40),
 		"yesBid", fmt.Sprintf("%.4f", yesBidOpt),
 		"noBid", fmt.Sprintf("%.4f", noBidOpt),
+		"size", fmt.Sprintf("$%.0f", orderSize),
 		"yesQueue", fmt.Sprintf("$%.0f", yesQueue),
 		"noQueue", fmt.Sprintf("$%.0f", noQueue),
 		"reward", fmt.Sprintf("$%.4f/d", opp.YourDailyReward),
@@ -671,13 +731,16 @@ func (pe *PaperEngine) saveDailySummary(ctx context.Context, result *PaperCycleR
 		PartialFills:    partial,
 		TotalReward:     totalReward,
 		TotalFillPnL:    fillPnL,
-		NetPnL:          totalReward + fillPnL,
+		NetPnL:          totalReward + fillPnL + result.MergeProfit,
 		AvgPartialMins:  avgPartial,
 		FillsYes:        fillsYes,
 		FillsNo:         fillsNo,
 		OrdersPlaced:    result.NewOrders,
 		CapitalDeployed: result.CapitalDeployed,
 		MarketsResolved: result.MarketsResolved,
+		Rotations:       result.Merges,
+		MergeProfit:     result.MergeProfit,
+		CompoundBalance: result.CompoundBalance,
 	}
 
 	if err := pe.store.SavePaperDaily(ctx, summary); err != nil {
@@ -746,4 +809,354 @@ func maxF(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+// mergeCompletePairs finds all pairs with both sides FILLED and simulates
+// the CTF merge (YES+NO → $1.00), freeing capital for compound rotation.
+func (pe *PaperEngine) mergeCompletePairs(ctx context.Context) (merges int, totalProfit float64, err error) {
+	filledOrders, err := pe.store.GetAllPaperOrders(ctx, string(domain.PaperStatusFilled))
+	if err != nil {
+		return 0, 0, fmt.Errorf("paper.mergeCompletePairs: %w", err)
+	}
+
+	byPair := make(map[string][]domain.VirtualOrder)
+	for _, o := range filledOrders {
+		byPair[o.PairID] = append(byPair[o.PairID], o)
+	}
+
+	now := time.Now().UTC()
+
+	for _, orders := range byPair {
+		var yes, no *domain.VirtualOrder
+		for i := range orders {
+			switch orders[i].Side {
+			case "YES":
+				yes = &orders[i]
+			case "NO":
+				no = &orders[i]
+			}
+		}
+		if yes == nil || no == nil {
+			continue
+		}
+
+		yesPrice := yes.FilledPrice
+		if yesPrice == 0 {
+			yesPrice = yes.BidPrice
+		}
+		noPrice := no.FilledPrice
+		if noPrice == 0 {
+			noPrice = no.BidPrice
+		}
+
+		yesShares := yes.Size / yesPrice
+		noShares := no.Size / noPrice
+		mergeable := min(yesShares, noShares)
+		mergeReturn := mergeable * 1.0
+		capitalSpent := yes.Size + no.Size
+		profit := mergeReturn - capitalSpent
+
+		if err := pe.store.MarkPaperOrderMerged(ctx, yes.ID, now); err != nil {
+			slog.Warn("paper: error marking YES as merged", "err", err)
+			continue
+		}
+		if err := pe.store.MarkPaperOrderMerged(ctx, no.ID, now); err != nil {
+			slog.Warn("paper: error marking NO as merged", "err", err)
+			continue
+		}
+
+		cycleTime := now.Sub(yes.PlacedAt)
+		slog.Info("paper: MERGED pair (compound rotation)",
+			"market", truncateStr(yes.Question, 30),
+			"profit", fmt.Sprintf("$%.4f", profit),
+			"return", fmt.Sprintf("$%.2f", mergeReturn),
+			"spent", fmt.Sprintf("$%.2f", capitalSpent),
+			"cycle", fmt.Sprintf("%.1fh", cycleTime.Hours()),
+		)
+
+		merges++
+		totalProfit += profit
+	}
+
+	return merges, totalProfit, nil
+}
+
+// getCompoundMetrics computes the compound balance and rotation stats from all
+// MERGED orders in the database.
+func (pe *PaperEngine) getCompoundMetrics(ctx context.Context) (balance, totalProfit float64, rotations int, avgCycleHours float64) {
+	mergedOrders, err := pe.store.GetAllPaperOrders(ctx, string(domain.PaperStatusMerged))
+	if err != nil {
+		return pe.cfg.InitialCapital, 0, 0, 0
+	}
+
+	byPair := make(map[string][]domain.VirtualOrder)
+	for _, o := range mergedOrders {
+		byPair[o.PairID] = append(byPair[o.PairID], o)
+	}
+
+	var totalCycleHours float64
+
+	for _, orders := range byPair {
+		var yes, no *domain.VirtualOrder
+		for i := range orders {
+			switch orders[i].Side {
+			case "YES":
+				yes = &orders[i]
+			case "NO":
+				no = &orders[i]
+			}
+		}
+		if yes == nil || no == nil {
+			continue
+		}
+
+		yesPrice := yes.FilledPrice
+		if yesPrice == 0 {
+			yesPrice = yes.BidPrice
+		}
+		noPrice := no.FilledPrice
+		if noPrice == 0 {
+			noPrice = no.BidPrice
+		}
+
+		yesShares := yes.Size / yesPrice
+		noShares := no.Size / noPrice
+		mergeable := min(yesShares, noShares)
+		mergeReturn := mergeable * 1.0
+		capitalSpent := yes.Size + no.Size
+		profit := mergeReturn - capitalSpent
+
+		totalProfit += profit
+		rotations++
+
+		if yes.MergedAt != nil {
+			totalCycleHours += yes.MergedAt.Sub(yes.PlacedAt).Hours()
+		}
+	}
+
+	deployed := pe.calculateDeployedCapital(ctx)
+	balance = pe.cfg.InitialCapital + totalProfit - deployed
+
+	if rotations > 0 {
+		avgCycleHours = totalCycleHours / float64(rotations)
+	}
+
+	return balance, totalProfit, rotations, avgCycleHours
+}
+
+// kellyFraction computes the optimal fraction of bankroll to deploy using
+// the Kelly Criterion. (Strategy 9)
+//
+//	f* = (p × b - q) / b
+//	p = probability of completing a pair (both fills)
+//	b = profit / capital when pair completes
+//	q = 1 - p
+//
+// Uses half-Kelly for safety (standard practice in professional trading).
+// Returns a fraction [0.1, 1.0] that grows as paper data confirms the edge.
+func (pe *PaperEngine) kellyFraction(ctx context.Context) float64 {
+	stats, err := pe.store.GetPaperStats(ctx)
+	if err != nil || stats.TotalOrders < 4 {
+		return 0.5 // not enough data → conservative half deployment
+	}
+
+	totalPairsAttempted := stats.TotalOrders / 2
+	if totalPairsAttempted == 0 {
+		return 0.5
+	}
+
+	// p = pair completion rate (completed + merged vs total attempted)
+	completed := stats.CompletePairs + stats.TotalRotations
+	p := float64(completed) / float64(totalPairsAttempted)
+
+	// If we have rotation data, compute Kelly from actual merge profits
+	if stats.TotalRotations > 0 && stats.TotalMergeProfit > 0 {
+		avgProfitPerRotation := stats.TotalMergeProfit / float64(stats.TotalRotations)
+		avgCapitalPerPair := 2 * pe.cfg.OrderSize
+
+		// b = profit ratio per completed pair
+		b := avgProfitPerRotation / avgCapitalPerPair
+		q := 1 - p
+
+		if b > 0 {
+			kelly := (p*b - q) / b
+			halfKelly := kelly / 2.0
+
+			if halfKelly < 0.1 {
+				halfKelly = 0.1
+			}
+			if halfKelly > 1.0 {
+				halfKelly = 1.0
+			}
+
+			slog.Debug("paper: Kelly computed from merge data",
+				"p", fmt.Sprintf("%.2f", p),
+				"b", fmt.Sprintf("%.4f", b),
+				"fullKelly", fmt.Sprintf("%.2f", kelly),
+				"halfKelly", fmt.Sprintf("%.2f", halfKelly),
+			)
+			return halfKelly
+		}
+	}
+
+	// Fallback: use fill rate as confidence proxy
+	fillRate := float64(stats.TotalFills) / float64(max(stats.DaysRunning, 1))
+	switch {
+	case fillRate > 4:
+		return 0.9
+	case fillRate > 2:
+		return 0.7
+	case fillRate > 1:
+		return 0.6
+	default:
+		return 0.4
+	}
+}
+
+// rotateStaleOrders cancels order pairs where BOTH sides are still OPEN
+// after paperStaleHours. This frees capital for markets with faster fills.
+// (Strategy 6: Dynamic Rotation)
+func (pe *PaperEngine) rotateStaleOrders(ctx context.Context) int {
+	openOrders, err := pe.store.GetOpenPaperOrders(ctx)
+	if err != nil {
+		return 0
+	}
+
+	byPair := make(map[string][]domain.VirtualOrder)
+	for _, o := range openOrders {
+		byPair[o.PairID] = append(byPair[o.PairID], o)
+	}
+
+	expired := 0
+	for _, orders := range byPair {
+		if len(orders) < 2 {
+			continue
+		}
+
+		allOpen := true
+		var oldest time.Time
+		for _, o := range orders {
+			if o.Status != domain.PaperStatusOpen {
+				allOpen = false
+				break
+			}
+			if oldest.IsZero() || o.PlacedAt.Before(oldest) {
+				oldest = o.PlacedAt
+			}
+		}
+
+		if !allOpen || oldest.IsZero() {
+			continue
+		}
+
+		age := time.Since(oldest).Hours()
+		if age < paperStaleHours {
+			continue
+		}
+
+		conditionID := orders[0].ConditionID
+		if err := pe.store.ExpirePaperOrders(ctx, conditionID); err != nil {
+			slog.Warn("paper: error expiring stale pair", "err", err)
+			continue
+		}
+
+		slog.Info("paper: ROTATED stale pair (no fills)",
+			"market", truncateStr(orders[0].Question, 30),
+			"age", fmt.Sprintf("%.1fh", age),
+			"queueY", fmt.Sprintf("$%.0f", orders[0].QueueAhead),
+		)
+		expired++
+	}
+
+	return expired
+}
+
+// compoundVelocityScore ranks opportunities by expected compound rotation speed.
+// Higher score = faster fills + more profit per pair = better for compound growth.
+// (Strategy 4: New market timing + Strategy 6: Dynamic rotation)
+func compoundVelocityScore(opp domain.Opportunity) float64 {
+	yesQueue := queuePosition(opp.YesBook, opp.YesBook.BestBid())
+	noQueue := queuePosition(opp.NoBook, opp.NoBook.BestBid())
+	totalQueue := yesQueue + noQueue
+
+	profitPerPair := -opp.FillCostPerPair
+	if profitPerPair <= 0 {
+		return 0
+	}
+
+	// Velocity: inverse of queue depth (shorter queue = faster fill)
+	velocityFactor := 1.0
+	if totalQueue > 0 {
+		velocityFactor = 100.0 / (100.0 + totalQueue)
+	}
+
+	// Reward bonus: earning rewards while waiting is gravy
+	rewardBonus := 1.0 + opp.YourDailyReward*10
+
+	return profitPerPair * velocityFactor * rewardBonus
+}
+
+// optimalOrderSize calculates the competition-aware order size that maximizes
+// reward per dollar deployed. (Strategy 2: Geometric Reward Maximization)
+//
+// The marginal reward curve is concave: dR/ds = dailyRate × C / (s+C)².
+// For low-competition markets we deploy more; for high-competition less.
+func (pe *PaperEngine) optimalOrderSize(opp domain.Opportunity) float64 {
+	competition := opp.Competition
+	if competition <= 0 {
+		competition = 1
+	}
+
+	dailyRate := opp.Market.Rewards.DailyRate
+	if dailyRate <= 0 {
+		return pe.cfg.OrderSize
+	}
+
+	// Marginal reward: dR/ds = dailyRate * C / (s + C)²
+	// At s = 0: dR/ds = dailyRate / C  (maximum marginal return)
+	// We want to allocate proportionally to sqrt(dailyRate * C)
+	// which is the KKT optimal solution s* = sqrt(dailyRate * C / lambda) - C
+	// Simplified: ratio against default, clamped to [min, 2×default]
+	marginalAtDefault := dailyRate * competition / ((pe.cfg.OrderSize + competition) * (pe.cfg.OrderSize + competition))
+	marginalAtZero := dailyRate / competition
+
+	if marginalAtZero <= 0 {
+		return pe.cfg.OrderSize
+	}
+
+	// Ratio: how much better is this market vs average
+	ratio := marginalAtDefault / marginalAtZero
+	// Lower competition → higher ratio → more capital
+	// Invert: ratio is lower when competition is lower (more attractive)
+	// Use sqrt(dailyRate / competition) as the signal
+	attractiveness := dailyRate / competition
+	baseAttractiveness := dailyRate / (competition + pe.cfg.OrderSize)
+
+	scaleFactor := 1.0
+	if baseAttractiveness > 0 {
+		scaleFactor = attractiveness / baseAttractiveness
+	}
+
+	// Clamp: between paperMinOrderSize and 2x default
+	optimal := pe.cfg.OrderSize * scaleFactor
+	if optimal > pe.cfg.OrderSize*2 {
+		optimal = pe.cfg.OrderSize * 2
+	}
+	if optimal < paperMinOrderSize {
+		optimal = paperMinOrderSize
+	}
+
+	// Log when size differs significantly from default
+	if optimal != pe.cfg.OrderSize && (optimal < pe.cfg.OrderSize*0.8 || optimal > pe.cfg.OrderSize*1.2) {
+		slog.Debug("paper: adaptive sizing",
+			"market", truncateStr(opp.Market.Question, 25),
+			"default", fmt.Sprintf("$%.0f", pe.cfg.OrderSize),
+			"optimal", fmt.Sprintf("$%.0f", optimal),
+			"competition", fmt.Sprintf("$%.0f", competition),
+			"dailyRate", fmt.Sprintf("$%.2f", dailyRate),
+			"ratio", fmt.Sprintf("%.2f", ratio),
+		)
+	}
+
+	return optimal
 }

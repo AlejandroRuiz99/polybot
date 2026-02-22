@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     question      TEXT,
     queue_ahead   REAL NOT NULL DEFAULT 0,
     daily_reward  REAL NOT NULL DEFAULT 0,
-    end_date      DATETIME
+    end_date      DATETIME,
+    merged_at     DATETIME
 );
 
 CREATE TABLE IF NOT EXISTS paper_fills (
@@ -51,7 +52,10 @@ CREATE TABLE IF NOT EXISTS paper_daily (
     orders_placed     INTEGER NOT NULL DEFAULT 0,
     capital_deployed  REAL NOT NULL DEFAULT 0,
     markets_resolved  INTEGER NOT NULL DEFAULT 0,
-    resolution_pnl    REAL NOT NULL DEFAULT 0
+    resolution_pnl    REAL NOT NULL DEFAULT 0,
+    rotations         INTEGER NOT NULL DEFAULT 0,
+    merge_profit      REAL NOT NULL DEFAULT 0,
+    compound_balance  REAL NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_paper_orders_pair   ON paper_orders(pair_id);
@@ -78,9 +82,13 @@ func (s *SQLiteStorage) ApplyPaperSchema(ctx context.Context) error {
 	for _, stmt := range []string{
 		"ALTER TABLE paper_orders ADD COLUMN daily_reward REAL NOT NULL DEFAULT 0",
 		"ALTER TABLE paper_orders ADD COLUMN end_date DATETIME",
+		"ALTER TABLE paper_orders ADD COLUMN merged_at DATETIME",
 		"ALTER TABLE paper_daily ADD COLUMN capital_deployed REAL NOT NULL DEFAULT 0",
 		"ALTER TABLE paper_daily ADD COLUMN markets_resolved INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE paper_daily ADD COLUMN resolution_pnl REAL NOT NULL DEFAULT 0",
+		"ALTER TABLE paper_daily ADD COLUMN rotations INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE paper_daily ADD COLUMN merge_profit REAL NOT NULL DEFAULT 0",
+		"ALTER TABLE paper_daily ADD COLUMN compound_balance REAL NOT NULL DEFAULT 0",
 	} {
 		s.db.ExecContext(ctx, stmt) // ignore errors (column already exists)
 	}
@@ -97,12 +105,12 @@ func (s *SQLiteStorage) SavePaperOrder(ctx context.Context, order domain.Virtual
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO paper_orders (id, condition_id, token_id, side, bid_price, size,
 		                          pair_id, placed_at, status, filled_at, filled_price,
-		                          question, queue_ahead, daily_reward, end_date)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                          question, queue_ahead, daily_reward, end_date, merged_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		order.ID, order.ConditionID, order.TokenID, order.Side, order.BidPrice,
 		order.Size, order.PairID, order.PlacedAt.UTC().Format(time.RFC3339),
 		string(order.Status), nil, order.FilledPrice, order.Question,
-		order.QueueAhead, order.DailyReward, endDate,
+		order.QueueAhead, order.DailyReward, endDate, nil,
 	)
 	if err != nil {
 		return fmt.Errorf("storage.SavePaperOrder: %w", err)
@@ -129,6 +137,17 @@ func (s *SQLiteStorage) MarkPaperOrderResolved(ctx context.Context, orderID stri
 		UPDATE paper_orders SET status = 'RESOLVED' WHERE id = ?`, orderID)
 	if err != nil {
 		return fmt.Errorf("storage.MarkPaperOrderResolved: %w", err)
+	}
+	return nil
+}
+
+// MarkPaperOrderMerged marks an order as merged (compound rotation complete).
+func (s *SQLiteStorage) MarkPaperOrderMerged(ctx context.Context, orderID string, mergedAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE paper_orders SET status = 'MERGED', merged_at = ? WHERE id = ?`,
+		mergedAt.UTC().Format(time.RFC3339), orderID)
+	if err != nil {
+		return fmt.Errorf("storage.MarkPaperOrderMerged: %w", err)
 	}
 	return nil
 }
@@ -175,7 +194,7 @@ func (s *SQLiteStorage) GetOpenPaperOrders(ctx context.Context) ([]domain.Virtua
 	return s.queryPaperOrders(ctx, `
 		SELECT id, condition_id, token_id, side, bid_price, size,
 		       pair_id, placed_at, status, filled_at, filled_price, question,
-		       queue_ahead, daily_reward, end_date
+		       queue_ahead, daily_reward, end_date, merged_at
 		FROM paper_orders WHERE status = 'OPEN'
 		ORDER BY placed_at DESC`)
 }
@@ -185,7 +204,7 @@ func (s *SQLiteStorage) GetPaperOrdersByPair(ctx context.Context, pairID string)
 	return s.queryPaperOrders(ctx, `
 		SELECT id, condition_id, token_id, side, bid_price, size,
 		       pair_id, placed_at, status, filled_at, filled_price, question,
-		       queue_ahead, daily_reward, end_date
+		       queue_ahead, daily_reward, end_date, merged_at
 		FROM paper_orders WHERE pair_id = ?
 		ORDER BY side`, pairID)
 }
@@ -216,14 +235,14 @@ func (s *SQLiteStorage) GetAllPaperOrders(ctx context.Context, status string) ([
 		return s.queryPaperOrders(ctx, `
 			SELECT id, condition_id, token_id, side, bid_price, size,
 			       pair_id, placed_at, status, filled_at, filled_price, question,
-			       queue_ahead, daily_reward, end_date
+			       queue_ahead, daily_reward, end_date, merged_at
 			FROM paper_orders WHERE status = ?
 			ORDER BY placed_at DESC`, status)
 	}
 	return s.queryPaperOrders(ctx, `
 		SELECT id, condition_id, token_id, side, bid_price, size,
 		       pair_id, placed_at, status, filled_at, filled_price, question,
-		       queue_ahead, daily_reward, end_date
+		       queue_ahead, daily_reward, end_date, merged_at
 		FROM paper_orders ORDER BY placed_at DESC`)
 }
 
@@ -233,8 +252,9 @@ func (s *SQLiteStorage) SavePaperDaily(ctx context.Context, d domain.PaperDailyS
 		INSERT INTO paper_daily (date, active_positions, complete_pairs, partial_fills,
 		                         total_reward, total_fill_pnl, net_pnl, avg_partial_mins,
 		                         fills_yes, fills_no, orders_placed, capital_deployed,
-		                         markets_resolved, resolution_pnl)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                         markets_resolved, resolution_pnl,
+		                         rotations, merge_profit, compound_balance)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(date) DO UPDATE SET
 		    active_positions = excluded.active_positions,
 		    complete_pairs   = excluded.complete_pairs,
@@ -248,11 +268,15 @@ func (s *SQLiteStorage) SavePaperDaily(ctx context.Context, d domain.PaperDailyS
 		    orders_placed    = excluded.orders_placed,
 		    capital_deployed = excluded.capital_deployed,
 		    markets_resolved = excluded.markets_resolved,
-		    resolution_pnl   = excluded.resolution_pnl`,
+		    resolution_pnl   = excluded.resolution_pnl,
+		    rotations        = excluded.rotations,
+		    merge_profit     = excluded.merge_profit,
+		    compound_balance = excluded.compound_balance`,
 		d.Date.UTC().Format("2006-01-02"), d.ActivePositions, d.CompletePairs,
 		d.PartialFills, d.TotalReward, d.TotalFillPnL, d.NetPnL,
 		d.AvgPartialMins, d.FillsYes, d.FillsNo, d.OrdersPlaced,
 		d.CapitalDeployed, d.MarketsResolved, d.ResolutionPnL,
+		d.Rotations, d.MergeProfit, d.CompoundBalance,
 	)
 	if err != nil {
 		return fmt.Errorf("storage.SavePaperDaily: %w", err)
@@ -266,7 +290,8 @@ func (s *SQLiteStorage) GetPaperDailies(ctx context.Context) ([]domain.PaperDail
 		SELECT date, active_positions, complete_pairs, partial_fills,
 		       total_reward, total_fill_pnl, net_pnl, avg_partial_mins,
 		       fills_yes, fills_no, orders_placed, capital_deployed,
-		       markets_resolved, resolution_pnl
+		       markets_resolved, resolution_pnl,
+		       rotations, merge_profit, compound_balance
 		FROM paper_daily ORDER BY date ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("storage.GetPaperDailies: %w", err)
@@ -282,6 +307,7 @@ func (s *SQLiteStorage) GetPaperDailies(ctx context.Context) ([]domain.PaperDail
 			&d.TotalReward, &d.TotalFillPnL, &d.NetPnL, &d.AvgPartialMins,
 			&d.FillsYes, &d.FillsNo, &d.OrdersPlaced, &d.CapitalDeployed,
 			&d.MarketsResolved, &d.ResolutionPnL,
+			&d.Rotations, &d.MergeProfit, &d.CompoundBalance,
 		); err != nil {
 			return nil, fmt.Errorf("storage.GetPaperDailies: scan: %w", err)
 		}
@@ -320,14 +346,29 @@ func (s *SQLiteStorage) GetPaperStats(ctx context.Context) (domain.PaperStats, e
 		stats.TotalOrders += d.OrdersPlaced
 		stats.MarketsResolved += d.MarketsResolved
 		stats.ResolutionPnL += d.ResolutionPnL
+		stats.TotalRotations += d.Rotations
+		stats.TotalMergeProfit += d.MergeProfit
 		if d.CapitalDeployed > stats.MaxCapital {
 			stats.MaxCapital = d.CapitalDeployed
 		}
 	}
 
+	if len(dailies) > 0 {
+		stats.CompoundBalance = dailies[len(dailies)-1].CompoundBalance
+	}
+
 	if stats.DaysRunning > 0 {
 		stats.DailyAvgPnL = stats.NetPnL / float64(stats.DaysRunning)
 		stats.FillRateReal = float64(stats.TotalFills) / float64(stats.DaysRunning)
+	}
+
+	// Compute average cycle time from merged orders
+	var avgCycle sql.NullFloat64
+	_ = s.db.QueryRowContext(ctx, `
+		SELECT AVG((julianday(merged_at) - julianday(placed_at)) * 24)
+		FROM paper_orders WHERE status = 'MERGED' AND merged_at IS NOT NULL`).Scan(&avgCycle)
+	if avgCycle.Valid && avgCycle.Float64 > 0 {
+		stats.AvgCycleHours = avgCycle.Float64
 	}
 
 	var maxPartial sql.NullFloat64
@@ -357,12 +398,12 @@ func (s *SQLiteStorage) queryPaperOrders(ctx context.Context, query string, args
 	for rows.Next() {
 		var o domain.VirtualOrder
 		var status, placedAt string
-		var filledAt, question, endDate sql.NullString
+		var filledAt, question, endDate, mergedAt sql.NullString
 
 		if err := rows.Scan(
 			&o.ID, &o.ConditionID, &o.TokenID, &o.Side, &o.BidPrice, &o.Size,
 			&o.PairID, &placedAt, &status, &filledAt, &o.FilledPrice,
-			&question, &o.QueueAhead, &o.DailyReward, &endDate,
+			&question, &o.QueueAhead, &o.DailyReward, &endDate, &mergedAt,
 		); err != nil {
 			return nil, fmt.Errorf("storage.queryPaperOrders: scan: %w", err)
 		}
@@ -378,6 +419,10 @@ func (s *SQLiteStorage) queryPaperOrders(ctx context.Context, query string, args
 		}
 		if endDate.Valid {
 			o.EndDate, _ = time.Parse(time.RFC3339, endDate.String)
+		}
+		if mergedAt.Valid {
+			t, _ := time.Parse(time.RFC3339, mergedAt.String)
+			o.MergedAt = &t
 		}
 
 		out = append(out, o)

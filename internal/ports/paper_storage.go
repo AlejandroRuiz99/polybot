@@ -14,6 +14,7 @@ type PaperStorage interface {
 	SavePaperOrder(ctx context.Context, order domain.VirtualOrder) error
 	MarkPaperOrderFilled(ctx context.Context, orderID string, filledAt time.Time, filledPrice float64) error
 	MarkPaperOrderResolved(ctx context.Context, orderID string) error
+	MarkPaperOrderMerged(ctx context.Context, orderID string, mergedAt time.Time) error
 	UpdatePaperOrderQueue(ctx context.Context, orderID string, queueAhead float64) error
 	ExpirePaperOrders(ctx context.Context, conditionID string) error
 	GetOpenPaperOrders(ctx context.Context) ([]domain.VirtualOrder, error)

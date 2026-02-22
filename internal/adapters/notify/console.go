@@ -488,6 +488,18 @@ func (c *Console) PrintPaperStatus(result PaperStatusInput) {
 		now, active, complete, partial, result.NewOrders, result.NewFills,
 		rewardAccrued, result.CapitalDeployed)
 
+	if result.CompoundBalance > 0 || result.TotalRotations > 0 {
+		growth := 0.0
+		if result.InitialCapital > 0 {
+			growth = ((result.InitialCapital + result.TotalMergeProfit) / result.InitialCapital - 1) * 100
+		}
+		fmt.Fprintf(&sb, " | bal $%.2f (+%.1f%%) | %d rot | K%.0f%%",
+			result.CompoundBalance, growth, result.TotalRotations, result.KellyFraction*100)
+		if result.Merges > 0 {
+			fmt.Fprintf(&sb, " | +%d merge $%.4f", result.Merges, result.MergeProfit)
+		}
+	}
+
 	for i, alert := range result.Alerts {
 		if i >= 2 {
 			break
@@ -512,6 +524,14 @@ type PaperStatusInput struct {
 	Alerts          []string
 	Warnings        []string
 	CapitalDeployed float64
+	Merges          int
+	MergeProfit     float64
+	CompoundBalance float64
+	TotalRotations  int
+	TotalMergeProfit float64
+	InitialCapital  float64
+	AvgCycleHours   float64
+	KellyFraction   float64
 }
 
 // PrintPaperReport prints a comprehensive paper trading report.
@@ -532,9 +552,13 @@ func (c *Console) PrintPaperReport(stats domain.PaperStats) {
 
 	if len(stats.Dailies) > 0 {
 		tbl := tablewriter.NewWriter(c.out)
-		tbl.Header("Date", "Pos", "Pairs", "Part", "FillY", "FillN", "Reward", "FillPnL", "Net", "Cap$")
+		tbl.Header("Date", "Pos", "Pairs", "Part", "FillY", "FillN", "Reward", "MrgPnL", "Net", "Cap$", "Rot", "Bal$")
 
 		for _, d := range stats.Dailies {
+			balLabel := "-"
+			if d.CompoundBalance > 0 {
+				balLabel = fmt.Sprintf("$%.0f", d.CompoundBalance)
+			}
 			tbl.Append(
 				d.Date.Format("01-02"),
 				fmt.Sprintf("%d", d.ActivePositions),
@@ -543,9 +567,11 @@ func (c *Console) PrintPaperReport(stats domain.PaperStats) {
 				fmt.Sprintf("%d", d.FillsYes),
 				fmt.Sprintf("%d", d.FillsNo),
 				fmt.Sprintf("$%.4f", d.TotalReward),
-				fmt.Sprintf("$%.4f", d.TotalFillPnL),
+				fmt.Sprintf("$%.4f", d.MergeProfit),
 				fmt.Sprintf("$%.4f", d.NetPnL),
 				fmt.Sprintf("$%.0f", d.CapitalDeployed),
+				fmt.Sprintf("%d", d.Rotations),
+				balLabel,
 			)
 		}
 		tbl.Render()
@@ -580,6 +606,32 @@ func (c *Console) PrintPaperReport(stats domain.PaperStats) {
 		if stats.MaxCapital > 0 {
 			apr := (stats.DailyAvgPnL / stats.MaxCapital) * 365 * 100
 			fmt.Fprintf(c.out, "  Projected APR:         %.1f%%\n", apr)
+		}
+	}
+
+	fmt.Fprintf(c.out, "\n  --- COMPOUND ROTATION ---\n")
+	fmt.Fprintf(c.out, "  Initial capital:       $%.0f\n", stats.InitialCapital)
+	fmt.Fprintf(c.out, "  Total rotations:       %d\n", stats.TotalRotations)
+	fmt.Fprintf(c.out, "  Total merge profit:    $%.4f\n", stats.TotalMergeProfit)
+	if stats.InitialCapital > 0 {
+		effectiveCap := stats.InitialCapital + stats.TotalMergeProfit
+		growth := (effectiveCap/stats.InitialCapital - 1) * 100
+		fmt.Fprintf(c.out, "  Effective capital:     $%.2f (+%.2f%%)\n", effectiveCap, growth)
+		fmt.Fprintf(c.out, "  Compound balance:      $%.2f\n", stats.CompoundBalance)
+	}
+	if stats.AvgCycleHours > 0 {
+		fmt.Fprintf(c.out, "  Avg cycle time:        %.1f hours\n", stats.AvgCycleHours)
+		cyclesPerDay := 24.0 / stats.AvgCycleHours
+		fmt.Fprintf(c.out, "  Cycles/day (est):      %.1f\n", cyclesPerDay)
+		if stats.TotalRotations > 0 && stats.InitialCapital > 0 {
+			profitPerRotation := stats.TotalMergeProfit / float64(stats.TotalRotations)
+			dailyReturn := profitPerRotation * cyclesPerDay / stats.InitialCapital
+			fmt.Fprintf(c.out, "  Profit/rotation:       $%.4f\n", profitPerRotation)
+			fmt.Fprintf(c.out, "  Est. daily return:     %.3f%%\n", dailyReturn*100)
+			monthly := stats.InitialCapital * math.Pow(1+dailyReturn, 30)
+			yearly := stats.InitialCapital * math.Pow(1+dailyReturn, 365)
+			fmt.Fprintf(c.out, "  Compound 30d:          $%.2f\n", monthly)
+			fmt.Fprintf(c.out, "  Compound 365d:         $%.2f\n", yearly)
 		}
 	}
 
