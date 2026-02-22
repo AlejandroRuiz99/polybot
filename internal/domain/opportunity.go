@@ -3,7 +3,6 @@ package domain
 import "time"
 
 // Opportunity es el resultado del análisis de un mercado.
-// Contiene todas las métricas calculadas para decidir si vale la pena proveer liquidez.
 type Opportunity struct {
 	Market    Market
 	YesBook   OrderBook
@@ -11,30 +10,40 @@ type Opportunity struct {
 	ScannedAt time.Time
 
 	// --- Spread y calificación ---
-	SpreadTotal     float64 // best_ask_YES + best_ask_NO - 1.0
-	QualifiesReward bool    // spread_total <= max_spread
+	SpreadTotal     float64
+	QualifiesReward bool
 
-	// --- Arbitraje (C3) ---
-	YesAsk      float64 // mejor ask del token YES
-	NoAsk       float64 // mejor ask del token NO
-	YesNoSum    float64 // YesAsk + NoAsk (< 1.0 = hay arbitraje antes de fees)
-	ArbitrageGap float64 // 1.0 - YesNoSum - fees (> 0 = arbitraje neto rentable)
-	HasArbitrage bool    // ArbitrageGap > 0
+	// --- Análisis de arbitraje ---
+	Arbitrage ArbitrageResult
 
-	// --- Tu ganancia real (C1, C6) ---
+	// --- Tu reward puro (sin costes) ---
 	Competition     float64 // USDC dentro del max_spread (ambos tokens)
-	YourShare       float64 // tu fracción estimada del pool (orderSize / competition)
+	YourShare       float64 // orderSize / (orderSize + competition)
 	SpreadScore     float64 // ((maxSpread - spread) / maxSpread)²
-	YourDailyReward float64 // reward diario estimado para ti (USDC)
-	NetProfitEst    float64 // YourDailyReward - fees
+	YourDailyReward float64 // reward bruto diario estimado para ti
 
-	// --- Score heredado (para tests legacy) ---
-	RewardScore float64 // S = ((v-s)/v)² × b (pool total, no ajustado por competencia)
+	// --- Costes reales de fill ---
+	FillCostPerPair float64 // coste por share pair: (yesP + noP)(1+fee) - 1.0
+	FillCostUSDC    float64 // coste en $ por evento de fill
+	BreakEvenFills  float64 // fills/día antes de perder dinero (∞ = fills gratis)
+
+	// --- P&L bajo escenarios ---
+	PnLNoFills  float64 // reward puro, 0 fills (mejor caso)
+	PnL1Fill    float64 // reward - 1 fill/día (conservador)
+	PnL3Fills   float64 // reward - 3 fills/día (activo)
+
+	// --- Score y categoría ---
+	CombinedScore float64             // = PnL1Fill (escenario conservador como ranking)
+	Category      OpportunityCategory // Gold / Silver / Bronze / Avoid
+
+	// --- Legacy ---
+	RewardScore  float64
+	NetProfitEst float64 // deprecated, usar PnL escenarios
 }
 
-// IsArbitrage devuelve true si el spread total es negativo (arbitraje implícito).
+// IsArbitrage devuelve true si hay arbitraje neto rentable (tras fees).
 func (o Opportunity) IsArbitrage() bool {
-	return o.SpreadTotal < 0
+	return o.Arbitrage.HasArbitrage
 }
 
 // YesMidpoint devuelve el midpoint del token YES.
@@ -47,12 +56,28 @@ func (o Opportunity) NoMidpoint() float64 {
 	return o.NoBook.Midpoint()
 }
 
-// APR devuelve el APR estimado basado en YourDailyReward y orderSize.
+// APR devuelve el APR estimado basado en CombinedScore (PnL 1fill/day) y orderSize.
 func (o Opportunity) APR(orderSize float64) float64 {
-	if orderSize <= 0 {
+	if orderSize <= 0 || o.CombinedScore <= 0 {
 		return 0
 	}
-	// Invertimos en 2 lados (YES + NO), capital total = 2 * orderSize
 	capital := orderSize * 2
-	return (o.YourDailyReward / capital) * 365 * 100
+	return (o.CombinedScore / capital) * 365 * 100
+}
+
+// Verdict devuelve una descripción honesta de la rentabilidad.
+func (o Opportunity) Verdict() string {
+	if o.FillCostPerPair <= 0 {
+		return "FILLS=PROFIT" // true arb
+	}
+	if o.BreakEvenFills > 10 {
+		return "SAFE"
+	}
+	if o.BreakEvenFills > 3 {
+		return "OK"
+	}
+	if o.BreakEvenFills > 1 {
+		return "RISKY"
+	}
+	return "AVOID"
 }

@@ -21,13 +21,21 @@ type Config struct {
 type ScannerConfig struct {
 	IntervalSeconds      int     `yaml:"interval_seconds"`
 	OrderSizeUSDC        float64 `yaml:"order_size_usdc"`
-	FeeRateDefault       float64 `yaml:"fee_rate_default"`       // C6: default conservador si la API no devuelve fee
-	MinYourDailyReward   float64 `yaml:"min_your_daily_reward"`  // C4: mínimo tu $/día
+	FeeRateDefault       float64 `yaml:"fee_rate_default"`        // default conservador si la API no devuelve fee
+	MinYourDailyReward   float64 `yaml:"min_your_daily_reward"`   // mínimo tu $/día para pasar el filtro
 	MinRewardScore       float64 `yaml:"min_reward_score"`
 	MaxSpreadTotal       float64 `yaml:"max_spread_total"`
 	MaxCompetition       float64 `yaml:"max_competition"`
 	RequireQualifies     bool    `yaml:"require_qualifies"`
-	MinHoursToResolution float64 `yaml:"min_hours_to_resolution"` // C5: filtrar mercados que se resuelven pronto
+	MinHoursToResolution float64 `yaml:"min_hours_to_resolution"` // filtrar mercados que se resuelven pronto
+
+	// Filtro de seguridad
+	OnlyFillsProfit bool `yaml:"only_fills_profit"` // true = descartar mercados donde un fill te cuesta dinero
+
+	// Arbitraje + concurrencia
+	ArbFillsPerDay  float64 `yaml:"arb_fills_per_day"`   // fills estimados/día para cálculo de arb profit
+	GoldMinReward   float64 `yaml:"gold_min_reward"`     // mínimo YourDailyReward para categoría Gold
+	AnalysisWorkers int     `yaml:"analysis_workers"`    // goroutines para análisis paralelo (0 = NumCPU*2)
 }
 
 // APIConfig contiene los base URLs de las APIs.
@@ -93,7 +101,13 @@ func setDefaults(cfg *Config) {
 		cfg.Scanner.OrderSizeUSDC = 100
 	}
 	if cfg.Scanner.FeeRateDefault <= 0 {
-		cfg.Scanner.FeeRateDefault = 0.02 // C6: 2% default conservador
+		cfg.Scanner.FeeRateDefault = 0.02 // 2% default conservador
+	}
+	if cfg.Scanner.ArbFillsPerDay <= 0 {
+		cfg.Scanner.ArbFillsPerDay = 2.0 // estimación conservadora de fills/día en mercados Gold
+	}
+	if cfg.Scanner.GoldMinReward <= 0 {
+		cfg.Scanner.GoldMinReward = 0.01 // mínimo $0.01/día de reward para entrar en Gold/Silver
 	}
 	if cfg.API.CLOBBase == "" {
 		cfg.API.CLOBBase = "https://clob.polymarket.com"

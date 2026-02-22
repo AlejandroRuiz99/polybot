@@ -2,20 +2,30 @@ scanner:
   interval_seconds: 30              # frecuencia de escaneo
   order_size_usdc: 100              # tamaño hipotético de órdenes para scoring
 
-  # C6: fee conservador si el mercado no devuelve su fee real
+  # Fee conservador si el mercado no devuelve su fee real
   fee_rate_default: 0.02            # 2% — ajustar si conoces los fees reales
 
-  # C1/C4: filtrar por tu ganancia real estimada
+  # Filtrar por tu ganancia real estimada
   min_your_daily_reward: 0.0        # sin mínimo; sube a 0.01 para filtrar ruido
 
   # Filtros adicionales
   min_reward_score: 0.0
   max_spread_total: 0.10            # safety net: spread máximo absoluto
-  max_competition: 100000           # USDC máximos de competencia en el book
+  max_competition: 5000             # USDC máximos de competencia en el book
   require_qualifies: true           # solo mercados que califican para reward
 
-  # C5: ignorar mercados que se resuelven pronto (0 = sin filtro)
+  # Ignorar mercados que se resuelven pronto (0 = sin filtro)
   min_hours_to_resolution: 48       # ignorar mercados con < 48h hasta resolución
+
+  # SEGURIDAD: solo operar mercados donde los fills son gratis o rentables
+  only_fills_profit: true           # true = descartar mercados con Fill$ > 0 (tóxicos)
+
+  # Arbitraje + concurrencia
+  arb_fills_per_day: 2.0            # fills estimados/día para cálculo de P&L de fills
+  gold_min_reward: 0.01             # mínimo reward/día para aparecer como Gold/Silver
+                                    # (Gold = fills < 2% coste, Silver = fills 2-5%)
+                                    # sube a 0.05 o 0.10 para filtrar mercados pequeños
+  analysis_workers: 0               # 0 = auto (NumCPU*2 goroutines para análisis paralelo)
 
 api:
   clob_base: "https://clob.polymarket.com"

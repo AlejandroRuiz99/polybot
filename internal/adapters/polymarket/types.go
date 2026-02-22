@@ -1,5 +1,7 @@
 package polymarket
 
+import "encoding/json"
+
 // DTOs raw de la API de Polymarket. Solo se usan dentro de este paquete.
 // La conversión a domain entities se hace en mapping.go.
 
@@ -70,15 +72,16 @@ type bookEntryRaw struct {
 type gammaMarketsResponse []gammaMarket
 
 // gammaMarket contiene la metadata enriquecida de un mercado.
+// Gamma devuelve algunos campos numéricos como strings JSON, usamos json.Number.
 type gammaMarket struct {
-	ConditionID  string  `json:"conditionId"`
-	Question     string  `json:"question"`
-	Slug         string  `json:"slug"`
-	EndDateISO   string  `json:"endDateIso"`
-	Volume       float64 `json:"volume"`
-	Volume24h    float64 `json:"volume24hr"`
-	Liquidity    float64 `json:"liquidity"`
-	MakerBaseFee float64 `json:"makerBaseFee"`
-	Active       bool    `json:"active"`
-	Closed       bool    `json:"closed"`
+	ConditionID  string      `json:"conditionId"`
+	Question     string      `json:"question"`
+	Slug         string      `json:"slug"`
+	EndDateISO   string      `json:"endDateIso"`
+	Volume       json.Number `json:"volume"`
+	Volume24h    json.Number `json:"volume24hr"`
+	Liquidity    json.Number `json:"liquidity"`
+	MakerBaseFee json.Number `json:"makerBaseFee"`
+	Active       bool        `json:"active"`
+	Closed       bool        `json:"closed"`
 }

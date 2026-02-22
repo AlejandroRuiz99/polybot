@@ -161,9 +161,9 @@ func TestScanner_RunOnce_BookProviderError(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestScanner_RunOnce_RankedByYourDailyReward(t *testing.T) {
-	// C4: el mercado con más ganancia REAL para ti va primero
-	// m2 tiene mayor pool Y menor competencia → debe ir primero
+func TestScanner_RunOnce_RankedByCombinedScore(t *testing.T) {
+	// El mercado con mayor CombinedScore va primero.
+	// Sin arbitraje, CombinedScore ≈ YourDailyReward → m2 (pool=100) antes que m1 (pool=10).
 	m1 := makeMarket("0xlow", "yL", "nL", 10.0, 0.04)
 	m2 := makeMarket("0xhigh", "yH", "nH", 100.0, 0.04)
 
@@ -181,7 +181,10 @@ func TestScanner_RunOnce_RankedByYourDailyReward(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Len(t, opps, 2)
-	// C4: ordenado por YourDailyReward, no por RewardScore total
+	// Ordenado por CombinedScore descendente
+	assert.GreaterOrEqual(t, opps[0].CombinedScore, opps[1].CombinedScore,
+		"debe estar ordenado por CombinedScore desc")
+	// Sin arb, CombinedScore ≈ YourDailyReward → el más rentable va primero
 	assert.GreaterOrEqual(t, opps[0].YourDailyReward, opps[1].YourDailyReward,
-		"debe estar ordenado por YourDailyReward desc")
+		"m2 con pool mayor debe ir antes")
 }

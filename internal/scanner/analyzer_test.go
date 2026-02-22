@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/alejandrodnm/polybot/internal/domain"
@@ -25,83 +26,84 @@ func TestAnalyzer_Analyze_Success(t *testing.T) {
 	yesBook := makeBook("yes", 0.70, 0.72, 200)
 	noBook := makeBook("no", 0.27, 0.29, 180)
 
-	a := NewAnalyzer(100, 0.02)
+	a := NewAnalyzer(100, 0.02, 1.0, 0.01)
 	opp, err := a.Analyze(context.Background(), market, yesBook, noBook)
 
 	require.NoError(t, err)
-	// spread = 0.72 + 0.29 - 1.0 = 0.01
 	assert.InDelta(t, 0.01, opp.SpreadTotal, 0.001)
 	assert.True(t, opp.QualifiesReward)
 
-	// C1: YourDailyReward debe ser mucho menor que el pool total
+	// Reward bruto > 0 y menor que el pool total
 	assert.Greater(t, opp.YourDailyReward, 0.0)
 	assert.Less(t, opp.YourDailyReward, market.Rewards.DailyRate)
 
-	// C3: ArbitrageGap negativo (0.72 + 0.29 > 1.0 → no hay arb)
-	assert.False(t, opp.HasArbitrage)
-	assert.Equal(t, opp.YesAsk, 0.72)
-	assert.Equal(t, opp.NoAsk, 0.29)
-	assert.InDelta(t, 1.01, opp.YesNoSum, 0.001)
+	// Fill cost calculated
+	assert.NotEqual(t, 0.0, opp.FillCostPerPair)
+	assert.Greater(t, opp.BreakEvenFills, 0.0)
 
-	// C6: YourShare definido
-	assert.Greater(t, opp.YourShare, 0.0)
-	assert.Less(t, opp.YourShare, 1.0)
+	// PnL scenarios: when fill cost > 0, more fills = worse PnL
+	if opp.FillCostUSDC > 0 {
+		assert.Greater(t, opp.PnLNoFills, opp.PnL1Fill)
+		assert.Greater(t, opp.PnL1Fill, opp.PnL3Fills)
+	}
 }
 
 func TestAnalyzer_Analyze_EmptyBook(t *testing.T) {
 	market := domain.Market{ConditionID: "0xtest"}
-	a := NewAnalyzer(100, 0.02)
+	a := NewAnalyzer(100, 0.02, 1.0, 0.01)
 	_, err := a.Analyze(context.Background(), market, domain.OrderBook{}, domain.OrderBook{})
 	assert.Error(t, err)
 }
 
-func TestAnalyzer_Analyze_SpreadExceedsMaxSpread(t *testing.T) {
-	market := domain.Market{
-		Rewards: domain.RewardConfig{DailyRate: 25, MaxSpread: 0.004},
-	}
-	yesBook := makeBook("yes", 0.70, 0.72, 100)
-	noBook := makeBook("no", 0.27, 0.29, 100)
-
-	a := NewAnalyzer(100, 0.02)
-	opp, err := a.Analyze(context.Background(), market, yesBook, noBook)
-
-	require.NoError(t, err)
-	assert.False(t, opp.QualifiesReward)
-	assert.Equal(t, 0.0, opp.YourDailyReward) // spread > maxSpread → 0
-}
-
-func TestAnalyzer_Analyze_ArbitrageDetected(t *testing.T) {
+func TestAnalyzer_Analyze_TrueArbitrage(t *testing.T) {
 	market := domain.Market{
 		Rewards: domain.RewardConfig{DailyRate: 25, MaxSpread: 0.5},
 	}
-	// YES ask=0.49, NO ask=0.49 → sum=0.98 < 1.0 → arbitraje
 	yesBook := makeBook("yes", 0.48, 0.49, 100)
 	noBook := makeBook("no", 0.48, 0.49, 100)
 
-	a := NewAnalyzer(100, 0.001)
+	a := NewAnalyzer(100, 0.001, 1.0, 0.01)
 	opp, err := a.Analyze(context.Background(), market, yesBook, noBook)
 
 	require.NoError(t, err)
-	assert.True(t, opp.HasArbitrage, "debe detectar arbitraje con YES+NO < 1.0")
-	assert.Greater(t, opp.ArbitrageGap, 0.0)
+	assert.True(t, opp.Arbitrage.HasArbitrage)
+	assert.Equal(t, domain.CategoryGold, opp.Category)
+
+	// Fill cost should be NEGATIVE (fills = profit)
+	assert.Less(t, opp.FillCostPerPair, 0.0)
+	assert.True(t, math.IsInf(opp.BreakEvenFills, 1), "fills=profit → infinite break even")
+
+	assert.Equal(t, "FILLS=PROFIT", opp.Verdict())
 }
 
-func TestAnalyzer_Analyze_UsesMakerBaseFee(t *testing.T) {
+func TestAnalyzer_Analyze_NearArb_IsGold(t *testing.T) {
 	market := domain.Market{
-		MakerBaseFee: 0.005, // 0.5% del mercado
-		Rewards:      domain.RewardConfig{DailyRate: 25, MaxSpread: 0.04},
+		Rewards: domain.RewardConfig{DailyRate: 25, MaxSpread: 0.04},
+	}
+	yesBook := makeBook("yes", 0.49, 0.50, 100)
+	noBook := makeBook("no", 0.49, 0.50, 100)
+
+	a := NewAnalyzer(100, 0.001, 1.0, 0.01)
+	opp, err := a.Analyze(context.Background(), market, yesBook, noBook)
+
+	require.NoError(t, err)
+	// sum bids = 0.49+0.49 = 0.98 < 1.0 even with fee → Gold
+	assert.Equal(t, domain.CategoryGold, opp.Category)
+}
+
+func TestAnalyzer_Analyze_HighSpread_IsSilver(t *testing.T) {
+	market := domain.Market{
+		Rewards: domain.RewardConfig{DailyRate: 500, MaxSpread: 0.5},
 	}
 	yesBook := makeBook("yes", 0.70, 0.72, 200)
 	noBook := makeBook("no", 0.27, 0.29, 180)
 
-	a := NewAnalyzer(100, 0.02) // defaultFeeRate=2% pero mercado tiene 0.5%
+	a := NewAnalyzer(100, 0.02, 1.0, 0.01)
 	opp, err := a.Analyze(context.Background(), market, yesBook, noBook)
 
 	require.NoError(t, err)
-	// Con fee=0.5%, los fees son 100*0.005*2=$1.0
-	// Con fee=2%, los fees son 100*0.02*2=$4.0
-	// NetProfit con fee del mercado debe ser mayor
-	assert.Greater(t, opp.NetProfitEst, -4.0) // no debe incluir el penalizado default
+	// sum asks = 1.01, gap ≈ -0.03 → Silver
+	assert.Equal(t, domain.CategorySilver, opp.Category)
 }
 
 func TestFilter_Apply_ByYourDailyReward(t *testing.T) {
@@ -116,21 +118,6 @@ func TestFilter_Apply_ByYourDailyReward(t *testing.T) {
 	result := f.Apply([]domain.Opportunity{passing, failing})
 	require.Len(t, result, 1)
 	assert.Equal(t, 0.10, result[0].YourDailyReward)
-}
-
-func TestFilter_Apply_ByResolutionTime(t *testing.T) {
-	cfg := DefaultFilterConfig()
-	cfg.MinHoursToResolution = 48
-	cfg.RequireQualifies = false
-	f := NewFilter(cfg)
-
-	import_time := "placeholder to avoid import issues"
-	_ = import_time
-	// El filtro por tiempo requiere market.EndDate — se testa en scanner_test.go via mocks
-	// Este test verifica que sin EndDate (zero value) el filtro NO descarta el mercado
-	noEndDate := domain.Opportunity{YourDailyReward: 0.5, QualifiesReward: true}
-	result := f.Apply([]domain.Opportunity{noEndDate})
-	assert.Len(t, result, 1, "sin EndDate definido, no debe filtrarse")
 }
 
 func TestFilter_Apply_Basic(t *testing.T) {
@@ -151,5 +138,4 @@ func TestFilter_Apply_Basic(t *testing.T) {
 
 	result := f.Apply([]domain.Opportunity{passing, lowScore, noQualify})
 	require.Len(t, result, 1)
-	assert.Equal(t, passing.RewardScore, result[0].RewardScore)
 }

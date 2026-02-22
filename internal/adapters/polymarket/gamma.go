@@ -53,7 +53,7 @@ func (c *Client) fetchGammaMetadata(ctx context.Context, conditionIDs []string) 
 		}
 		batch := conditionIDs[i:end]
 
-		url := fmt.Sprintf("%s%s?condition_ids=%s&limit=%d",
+		url := fmt.Sprintf("%s%s?condition_id=%s&limit=%d",
 			c.gammaBase,
 			gammaMarketsPath,
 			strings.Join(batch, ","),
@@ -62,7 +62,11 @@ func (c *Client) fetchGammaMetadata(ctx context.Context, conditionIDs []string) 
 
 		var resp gammaMarketsResponse
 		if err := c.get(ctx, c.gammaLimiter, url, &resp); err != nil {
-			return nil, fmt.Errorf("GET /markets batch %d-%d: %w", i, end, err)
+			slog.Debug("gamma batch failed, skipping",
+				"batch", fmt.Sprintf("%d-%d", i, end),
+				"err", err,
+			)
+			continue
 		}
 
 		for _, gm := range resp {

@@ -53,10 +53,13 @@ func mapSamplingMarket(r samplingMarket) domain.Market {
 func enrichFromGamma(m *domain.Market, gm gammaMarket) {
 	m.Question = gm.Question
 	m.Slug = gm.Slug
-	m.Volume24h = gm.Volume24h
 
-	if gm.MakerBaseFee > 0 && m.MakerBaseFee == 0 {
-		m.MakerBaseFee = gm.MakerBaseFee
+	if v, err := gm.Volume24h.Float64(); err == nil {
+		m.Volume24h = v
+	}
+
+	if fee, err := gm.MakerBaseFee.Float64(); err == nil && fee > 0 && m.MakerBaseFee == 0 {
+		m.MakerBaseFee = fee
 	}
 
 	if gm.EndDateISO != "" {

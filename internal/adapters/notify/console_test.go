@@ -13,7 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func makeOpp(question string, yourReward float64, qualifies bool) domain.Opportunity {
+func makeOpp(question string, yourReward, fillCost float64) domain.Opportunity {
+	be := yourReward / fillCost
 	return domain.Opportunity{
 		Market: domain.Market{
 			ConditionID: "0xtest",
@@ -22,21 +23,27 @@ func makeOpp(question string, yourReward float64, qualifies bool) domain.Opportu
 		},
 		ScannedAt:       time.Now(),
 		SpreadTotal:     0.02,
-		RewardScore:     yourReward * 50, // legacy score
 		YourDailyReward: yourReward,
+		FillCostPerPair: 0.01,
+		FillCostUSDC:    fillCost,
+		BreakEvenFills:  be,
+		PnLNoFills:      yourReward,
+		PnL1Fill:        yourReward - fillCost,
+		PnL3Fills:       yourReward - fillCost*3,
+		CombinedScore:   yourReward - fillCost, // PnL 1fill
+		Category:        domain.CategorySilver,
 		Competition:     3000,
-		NetProfitEst:    yourReward - 0.2,
-		QualifiesReward: qualifies,
+		QualifiesReward: true,
 	}
 }
 
-func TestConsole_Notify_WithOpportunities(t *testing.T) {
+func TestConsole_Compact_OneLine(t *testing.T) {
 	var buf bytes.Buffer
-	n := notify.NewConsoleWriter(&buf) // usa orderSize=100 por defecto
+	n := notify.NewConsoleWriter(&buf, false, false)
 
 	opps := []domain.Opportunity{
-		makeOpp("Will Trump win?", 24.0, true),
-		makeOpp("Will BTC hit 100k?", 12.5, false),
+		makeOpp("Will Trump win?", 0.50, 0.10),
+		makeOpp("Will BTC hit 100k?", 0.30, 0.08),
 	}
 
 	err := n.Notify(context.Background(), opps)
@@ -44,30 +51,41 @@ func TestConsole_Notify_WithOpportunities(t *testing.T) {
 
 	out := buf.String()
 	assert.Contains(t, out, "Will Trump win?")
-	assert.Contains(t, out, "Will BTC hit 100k?")
-	assert.Contains(t, out, "24.00")
-	assert.Contains(t, out, "12.50")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	assert.Len(t, lines, 1, "compact mode is 1 line")
 }
 
-func TestConsole_Notify_EmptyList(t *testing.T) {
+func TestConsole_Table_ShowsScenarios(t *testing.T) {
 	var buf bytes.Buffer
-	n := notify.NewConsoleWriter(&buf)
+	n := notify.NewConsoleWriter(&buf, true, false)
 
-	err := n.Notify(context.Background(), nil)
-	require.NoError(t, err)
-	assert.Contains(t, buf.String(), "No opportunities found")
-}
-
-func TestConsole_Notify_LongQuestionTruncated(t *testing.T) {
-	var buf bytes.Buffer
-	n := notify.NewConsoleWriter(&buf)
-
-	longQ := strings.Repeat("A", 50)
-	opps := []domain.Opportunity{makeOpp(longQ, 10, true)}
+	opps := []domain.Opportunity{makeOpp("Test market", 0.50, 0.10)}
 
 	err := n.Notify(context.Background(), opps)
 	require.NoError(t, err)
 
 	out := buf.String()
-	assert.Contains(t, out, "...")
+	// tablewriter uppercases headers and may insert spaces
+	assert.Contains(t, out, "RWD")
+	assert.Contains(t, out, "FILL")
+	assert.Contains(t, out, "VERDICT")
+}
+
+func TestConsole_Empty(t *testing.T) {
+	var buf bytes.Buffer
+	n := notify.NewConsoleWriter(&buf, false, false)
+	err := n.Notify(context.Background(), nil)
+	require.NoError(t, err)
+	assert.Contains(t, buf.String(), "no opportunities found")
+}
+
+func TestConsole_Compact_LongNameTruncated(t *testing.T) {
+	var buf bytes.Buffer
+	n := notify.NewConsoleWriter(&buf, false, false)
+
+	longQ := strings.Repeat("A", 50)
+	opps := []domain.Opportunity{makeOpp(longQ, 0.50, 0.10)}
+	err := n.Notify(context.Background(), opps)
+	require.NoError(t, err)
+	assert.NotContains(t, buf.String(), strings.Repeat("A", 50))
 }

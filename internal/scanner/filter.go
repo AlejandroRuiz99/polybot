@@ -18,17 +18,20 @@ type FilterConfig struct {
 	RequireQualifies bool
 	// MinHoursToResolution descarta mercados que se resuelven antes de X horas (C5).
 	MinHoursToResolution float64
+	// OnlyFillsProfit si true, descarta mercados donde un fill te cuesta dinero (FillCostUSDC > 0).
+	OnlyFillsProfit bool
 }
 
 // DefaultFilterConfig devuelve una configuración de filtrado conservadora.
 func DefaultFilterConfig() FilterConfig {
 	return FilterConfig{
-		MinYourDailyReward:   0.0,  // sin mínimo por defecto
+		MinYourDailyReward:   0.0,
 		MinRewardScore:       0.0,
 		MaxSpreadTotal:       0.10,
 		MaxCompetition:       50_000,
 		RequireQualifies:     true,
-		MinHoursToResolution: 0, // sin filtro de tiempo por defecto
+		MinHoursToResolution: 0,
+		OnlyFillsProfit:      true, // solo mercados donde los fills son gratis o te dan dinero
 	}
 }
 
@@ -73,10 +76,13 @@ func (f *Filter) passes(opp domain.Opportunity) bool {
 	// C5: filtrar mercados que se resuelven pronto
 	if f.cfg.MinHoursToResolution > 0 {
 		hours := opp.Market.HoursToResolution()
-		// Si EndDate no está definido (hours=0), no filtramos
 		if hours > 0 && hours < f.cfg.MinHoursToResolution {
 			return false
 		}
+	}
+	// Descartar mercados tóxicos: fill cost > 0 significa que cada fill te cuesta dinero
+	if f.cfg.OnlyFillsProfit && opp.FillCostUSDC > 0 {
+		return false
 	}
 	return true
 }

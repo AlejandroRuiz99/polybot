@@ -3,7 +3,7 @@ CMD        := ./cmd/scanner
 BUILD_DIR  := bin
 GOFLAGS    := -trimpath
 
-.PHONY: all build test lint run run-once run-dry clean tidy
+.PHONY: all build test lint run run-once run-dry backtest clean tidy
 
 all: build
 
@@ -25,6 +25,9 @@ run-once: build
 
 run-dry: build
 	./$(BUILD_DIR)/$(BINARY) --config config/config.yaml --once --dry-run
+
+backtest: build
+	./$(BUILD_DIR)/$(BINARY) --config config/config.yaml --backtest --verbose
 
 clean:
 	rm -rf $(BUILD_DIR) coverage.out
