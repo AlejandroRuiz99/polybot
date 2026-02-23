@@ -269,8 +269,8 @@ func (s *SQLiteStorage) SavePaperDaily(ctx context.Context, d domain.PaperDailyS
 		    capital_deployed = excluded.capital_deployed,
 		    markets_resolved = excluded.markets_resolved,
 		    resolution_pnl   = excluded.resolution_pnl,
-		    rotations        = excluded.rotations,
-		    merge_profit     = excluded.merge_profit,
+		    rotations        = paper_daily.rotations + excluded.rotations,
+		    merge_profit     = paper_daily.merge_profit + excluded.merge_profit,
 		    compound_balance = excluded.compound_balance`,
 		d.Date.UTC().Format("2006-01-02"), d.ActivePositions, d.CompletePairs,
 		d.PartialFills, d.TotalReward, d.TotalFillPnL, d.NetPnL,
@@ -285,6 +285,7 @@ func (s *SQLiteStorage) SavePaperDaily(ctx context.Context, d domain.PaperDailyS
 }
 
 // GetPaperDailies returns daily summaries in chronological order.
+// Rotations and merge profit per day are computed from paper_orders (source of truth).
 func (s *SQLiteStorage) GetPaperDailies(ctx context.Context) ([]domain.PaperDailySummary, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT date, active_positions, complete_pairs, partial_fills,
@@ -317,10 +318,105 @@ func (s *SQLiteStorage) GetPaperDailies(ctx context.Context) ([]domain.PaperDail
 		d.Date, _ = time.Parse("2006-01-02", dateStr)
 		out = append(out, d)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Enrich dailies with per-day merge data from paper_orders (source of truth).
+	s.enrichDailiesFromMergedOrders(ctx, out)
+
+	return out, nil
+}
+
+// enrichDailiesFromMergedOrders computes per-day rotations and merge profit
+// from MERGED paper_orders grouped by merged_at date.
+func (s *SQLiteStorage) enrichDailiesFromMergedOrders(ctx context.Context, dailies []domain.PaperDailySummary) {
+	if len(dailies) == 0 {
+		return
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT pair_id, side, bid_price, filled_price, size,
+		       DATE(merged_at) as merge_date
+		FROM paper_orders
+		WHERE status = 'MERGED' AND merged_at IS NOT NULL
+		ORDER BY pair_id, side`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	type halfPair struct {
+		price, size float64
+		mergeDate   string
+	}
+	pairs := make(map[string][2]*halfPair)
+	for rows.Next() {
+		var pairID, side, mergeDate string
+		var bid, filled, size float64
+		if rows.Scan(&pairID, &side, &bid, &filled, &size, &mergeDate) != nil {
+			continue
+		}
+		price := filled
+		if price == 0 {
+			price = bid
+		}
+		hp := &halfPair{price: price, size: size, mergeDate: mergeDate}
+		entry := pairs[pairID]
+		if side == "YES" {
+			entry[0] = hp
+		} else {
+			entry[1] = hp
+		}
+		pairs[pairID] = entry
+	}
+
+	type dayMerge struct {
+		rotations int
+		profit    float64
+	}
+	byDay := make(map[string]*dayMerge)
+
+	for _, p := range pairs {
+		if p[0] == nil || p[1] == nil {
+			continue
+		}
+		spread := 1.0 - p[0].price - p[1].price
+		yesShares := p[0].size / p[0].price
+		noShares := p[1].size / p[1].price
+		mergeable := yesShares
+		if noShares < mergeable {
+			mergeable = noShares
+		}
+		profit := mergeable * spread
+
+		date := p[0].mergeDate
+		if len(date) > 10 {
+			date = date[:10]
+		}
+		dm, ok := byDay[date]
+		if !ok {
+			dm = &dayMerge{}
+			byDay[date] = dm
+		}
+		dm.rotations++
+		dm.profit += profit
+	}
+
+	for i := range dailies {
+		dateKey := dailies[i].Date.Format("2006-01-02")
+		if dm, ok := byDay[dateKey]; ok {
+			dailies[i].Rotations = dm.rotations
+			dailies[i].MergeProfit = dm.profit
+			dailies[i].NetPnL = dailies[i].TotalReward + dailies[i].TotalFillPnL +
+				dailies[i].ResolutionPnL + dm.profit
+		}
+	}
 }
 
 // GetPaperStats computes aggregate stats from paper_orders and paper_daily.
+// Rotations and merge profit come from paper_orders (source of truth),
+// not from paper_daily snapshots which can lose intermediate merges.
 func (s *SQLiteStorage) GetPaperStats(ctx context.Context) (domain.PaperStats, error) {
 	dailies, err := s.GetPaperDailies(ctx)
 	if err != nil {
@@ -341,13 +437,10 @@ func (s *SQLiteStorage) GetPaperStats(ctx context.Context) (domain.PaperStats, e
 		stats.PartialFills += d.PartialFills
 		stats.TotalReward += d.TotalReward
 		stats.TotalFillPnL += d.TotalFillPnL
-		stats.NetPnL += d.NetPnL
 		stats.TotalFills += d.FillsYes + d.FillsNo
 		stats.TotalOrders += d.OrdersPlaced
 		stats.MarketsResolved += d.MarketsResolved
 		stats.ResolutionPnL += d.ResolutionPnL
-		stats.TotalRotations += d.Rotations
-		stats.TotalMergeProfit += d.MergeProfit
 		if d.CapitalDeployed > stats.MaxCapital {
 			stats.MaxCapital = d.CapitalDeployed
 		}
@@ -356,6 +449,56 @@ func (s *SQLiteStorage) GetPaperStats(ctx context.Context) (domain.PaperStats, e
 	if len(dailies) > 0 {
 		stats.CompoundBalance = dailies[len(dailies)-1].CompoundBalance
 	}
+
+	// Compute rotations and merge profit from paper_orders (source of truth).
+	// Each MERGED pair (YES+NO with same pair_id) is one rotation.
+	mergeRows, err := s.db.QueryContext(ctx, `
+		SELECT pair_id, side, bid_price, filled_price, size
+		FROM paper_orders WHERE status = 'MERGED'
+		ORDER BY pair_id, side`)
+	if err == nil {
+		defer mergeRows.Close()
+		type halfPair struct {
+			price, size float64
+		}
+		pairs := make(map[string][2]*halfPair) // pair_id → [0]=YES, [1]=NO
+		for mergeRows.Next() {
+			var pairID, side string
+			var bid, filled, size float64
+			if mergeRows.Scan(&pairID, &side, &bid, &filled, &size) != nil {
+				continue
+			}
+			price := filled
+			if price == 0 {
+				price = bid
+			}
+			hp := &halfPair{price: price, size: size}
+			entry := pairs[pairID]
+			if side == "YES" {
+				entry[0] = hp
+			} else {
+				entry[1] = hp
+			}
+			pairs[pairID] = entry
+		}
+
+		for _, p := range pairs {
+			if p[0] == nil || p[1] == nil {
+				continue
+			}
+			spread := 1.0 - p[0].price - p[1].price
+			yesShares := p[0].size / p[0].price
+			noShares := p[1].size / p[1].price
+			mergeable := yesShares
+			if noShares < mergeable {
+				mergeable = noShares
+			}
+			stats.TotalMergeProfit += mergeable * spread
+			stats.TotalRotations++
+		}
+	}
+
+	stats.NetPnL = stats.TotalReward + stats.TotalFillPnL + stats.ResolutionPnL + stats.TotalMergeProfit
 
 	if stats.DaysRunning > 0 {
 		stats.DailyAvgPnL = stats.NetPnL / float64(stats.DaysRunning)
