@@ -83,6 +83,7 @@ func (s *SQLiteStorage) ApplyPaperSchema(ctx context.Context) error {
 		"ALTER TABLE paper_orders ADD COLUMN daily_reward REAL NOT NULL DEFAULT 0",
 		"ALTER TABLE paper_orders ADD COLUMN end_date DATETIME",
 		"ALTER TABLE paper_orders ADD COLUMN merged_at DATETIME",
+		"ALTER TABLE paper_orders ADD COLUMN filled_size REAL NOT NULL DEFAULT 0",
 		"ALTER TABLE paper_daily ADD COLUMN capital_deployed REAL NOT NULL DEFAULT 0",
 		"ALTER TABLE paper_daily ADD COLUMN markets_resolved INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE paper_daily ADD COLUMN resolution_pnl REAL NOT NULL DEFAULT 0",
@@ -105,12 +106,12 @@ func (s *SQLiteStorage) SavePaperOrder(ctx context.Context, order domain.Virtual
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO paper_orders (id, condition_id, token_id, side, bid_price, size,
 		                          pair_id, placed_at, status, filled_at, filled_price,
-		                          question, queue_ahead, daily_reward, end_date, merged_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                          question, queue_ahead, daily_reward, end_date, merged_at, filled_size)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		order.ID, order.ConditionID, order.TokenID, order.Side, order.BidPrice,
 		order.Size, order.PairID, order.PlacedAt.UTC().Format(time.RFC3339),
 		string(order.Status), nil, order.FilledPrice, order.Question,
-		order.QueueAhead, order.DailyReward, endDate, nil,
+		order.QueueAhead, order.DailyReward, endDate, nil, order.FilledSize,
 	)
 	if err != nil {
 		return fmt.Errorf("storage.SavePaperOrder: %w", err)
@@ -153,6 +154,7 @@ func (s *SQLiteStorage) MarkPaperOrderMerged(ctx context.Context, orderID string
 }
 
 // UpdatePaperOrderQueue updates the queue position for an open order.
+// Only updates OPEN orders — PARTIAL orders keep their initial queue for fill calculation purposes.
 func (s *SQLiteStorage) UpdatePaperOrderQueue(ctx context.Context, orderID string, queueAhead float64) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE paper_orders SET queue_ahead = ? WHERE id = ? AND status = 'OPEN'`,
@@ -163,11 +165,23 @@ func (s *SQLiteStorage) UpdatePaperOrderQueue(ctx context.Context, orderID strin
 	return nil
 }
 
-// ExpirePaperOrders marks all OPEN orders for a condition as EXPIRED.
+// UpdatePaperOrderPartialFill updates the filled_size and status of a partially filled order.
+func (s *SQLiteStorage) UpdatePaperOrderPartialFill(ctx context.Context, orderID string, filledSize float64, filledPrice float64) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE paper_orders SET status = 'PARTIAL', filled_size = ?, filled_price = ?
+		WHERE id = ? AND status IN ('OPEN', 'PARTIAL')`,
+		filledSize, filledPrice, orderID)
+	if err != nil {
+		return fmt.Errorf("storage.UpdatePaperOrderPartialFill: %w", err)
+	}
+	return nil
+}
+
+// ExpirePaperOrders marks all OPEN and PARTIAL orders for a condition as EXPIRED.
 func (s *SQLiteStorage) ExpirePaperOrders(ctx context.Context, conditionID string) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE paper_orders SET status = 'EXPIRED'
-		WHERE condition_id = ? AND status = 'OPEN'`,
+		WHERE condition_id = ? AND status IN ('OPEN', 'PARTIAL')`,
 		conditionID,
 	)
 	if err != nil {
@@ -189,13 +203,14 @@ func (s *SQLiteStorage) SavePaperFill(ctx context.Context, fill domain.PaperFill
 	return nil
 }
 
-// GetOpenPaperOrders returns all OPEN virtual orders.
+// GetOpenPaperOrders returns all OPEN and PARTIAL virtual orders.
+// PARTIAL orders are still active in the book (being progressively filled).
 func (s *SQLiteStorage) GetOpenPaperOrders(ctx context.Context) ([]domain.VirtualOrder, error) {
 	return s.queryPaperOrders(ctx, `
 		SELECT id, condition_id, token_id, side, bid_price, size,
 		       pair_id, placed_at, status, filled_at, filled_price, question,
-		       queue_ahead, daily_reward, end_date, merged_at
-		FROM paper_orders WHERE status = 'OPEN'
+		       queue_ahead, daily_reward, end_date, merged_at, filled_size
+		FROM paper_orders WHERE status IN ('OPEN', 'PARTIAL')
 		ORDER BY placed_at DESC`)
 }
 
@@ -204,15 +219,15 @@ func (s *SQLiteStorage) GetPaperOrdersByPair(ctx context.Context, pairID string)
 	return s.queryPaperOrders(ctx, `
 		SELECT id, condition_id, token_id, side, bid_price, size,
 		       pair_id, placed_at, status, filled_at, filled_price, question,
-		       queue_ahead, daily_reward, end_date, merged_at
+		       queue_ahead, daily_reward, end_date, merged_at, filled_size
 		FROM paper_orders WHERE pair_id = ?
 		ORDER BY side`, pairID)
 }
 
-// GetActivePaperConditions returns distinct condition_ids with at least one OPEN order.
+// GetActivePaperConditions returns distinct condition_ids with at least one OPEN or PARTIAL order.
 func (s *SQLiteStorage) GetActivePaperConditions(ctx context.Context) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT DISTINCT condition_id FROM paper_orders WHERE status = 'OPEN'`)
+		SELECT DISTINCT condition_id FROM paper_orders WHERE status IN ('OPEN', 'PARTIAL')`)
 	if err != nil {
 		return nil, fmt.Errorf("storage.GetActivePaperConditions: %w", err)
 	}
@@ -235,14 +250,14 @@ func (s *SQLiteStorage) GetAllPaperOrders(ctx context.Context, status string) ([
 		return s.queryPaperOrders(ctx, `
 			SELECT id, condition_id, token_id, side, bid_price, size,
 			       pair_id, placed_at, status, filled_at, filled_price, question,
-			       queue_ahead, daily_reward, end_date, merged_at
+			       queue_ahead, daily_reward, end_date, merged_at, filled_size
 			FROM paper_orders WHERE status = ?
 			ORDER BY placed_at DESC`, status)
 	}
 	return s.queryPaperOrders(ctx, `
 		SELECT id, condition_id, token_id, side, bid_price, size,
 		       pair_id, placed_at, status, filled_at, filled_price, question,
-		       queue_ahead, daily_reward, end_date, merged_at
+		       queue_ahead, daily_reward, end_date, merged_at, filled_size
 		FROM paper_orders ORDER BY placed_at DESC`)
 }
 
@@ -546,7 +561,7 @@ func (s *SQLiteStorage) queryPaperOrders(ctx context.Context, query string, args
 		if err := rows.Scan(
 			&o.ID, &o.ConditionID, &o.TokenID, &o.Side, &o.BidPrice, &o.Size,
 			&o.PairID, &placedAt, &status, &filledAt, &o.FilledPrice,
-			&question, &o.QueueAhead, &o.DailyReward, &endDate, &mergedAt,
+			&question, &o.QueueAhead, &o.DailyReward, &endDate, &mergedAt, &o.FilledSize,
 		); err != nil {
 			return nil, fmt.Errorf("storage.queryPaperOrders: scan: %w", err)
 		}

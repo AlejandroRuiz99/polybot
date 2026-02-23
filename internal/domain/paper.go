@@ -7,6 +7,7 @@ type PaperOrderStatus string
 
 const (
 	PaperStatusOpen      PaperOrderStatus = "OPEN"
+	PaperStatusPartial   PaperOrderStatus = "PARTIAL" // partially filled, remaining in book
 	PaperStatusFilled    PaperOrderStatus = "FILLED"
 	PaperStatusExpired   PaperOrderStatus = "EXPIRED"
 	PaperStatusCancelled PaperOrderStatus = "CANCELLED"
@@ -21,14 +22,15 @@ type VirtualOrder struct {
 	TokenID      string
 	Side         string  // "YES" or "NO"
 	BidPrice     float64
-	Size         float64 // USDC
+	Size         float64    // USDC total order size
+	FilledSize   float64    // USDC amount filled so far (0 until partial/full fill)
 	PlacedAt     time.Time
 	Status       PaperOrderStatus
 	FilledAt     *time.Time
 	FilledPrice  float64
 	PairID       string // links YES+NO orders for the same market
 	Question     string
-	QueueAhead   float64    // estimated USDC ahead in the book at placement time
+	QueueAhead   float64    // estimated USDC ahead in the book at placement time (refreshed each cycle for display)
 	DailyReward  float64    // estimated daily reward at placement time
 	EndDate      time.Time
 	MergedAt     *time.Time // when the pair was merged (compound rotation)

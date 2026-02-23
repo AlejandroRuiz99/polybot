@@ -16,10 +16,25 @@ const (
 	paperMaxMarkets      = 10
 	paperMaxPartialHours = 6
 	paperNearEndHours    = 24
-	paperBidTickUp       = 0.01
 	paperDefaultCapital  = 1000
-	paperStaleHours      = 4
 	paperMinOrderSize    = 10.0
+
+	// Bid optimization: try up to 3 one-cent tick-ups per side.
+	paperMaxBidTickUp = 0.03
+	paperBidTickStep  = 0.01
+
+	// Merge realism: gas cost per merge tx (~$0.02 in POL gas), min delay before merging.
+	paperMergeGasCost   = 0.02
+	paperMergeDelayMins = 2
+
+	// Stale rotation: rotate if competition grew more than this multiplier since placement.
+	paperCompetitionMultiplier = 3.0
+
+	// Stale rotation: time-based threshold.
+	paperStaleHours = 4
+
+	// Reward accrual: use 15-minute blocks instead of continuous hours.
+	paperBlockMinutes = 15
 )
 
 // PaperConfig holds paper trading-specific settings.
@@ -96,27 +111,27 @@ func (pe *PaperEngine) RunOnce(ctx context.Context) (*PaperCycleResult, error) {
 		oppByCondition[opp.Market.ConditionID] = opp
 	}
 
-	// 2. Expire orders near resolution or for resolved markets (GAP #3, #6, #7)
+	// 2. Expire orders near resolution or for resolved markets
 	resolved := pe.expireResolvedAndNearEnd(ctx, oppByCondition)
 	result.MarketsResolved = resolved
 
-	// 3. Refresh queue positions with current book data (GAP #4)
+	// 3. Refresh queue positions with current book data (OPEN orders only; PARTIAL keep their queue)
 	pe.refreshQueues(ctx, oppByCondition)
 
-	// 3.5. Strategy 6: rotate stale orders (both sides OPEN >4h → free capital)
-	staleExpired := pe.rotateStaleOrders(ctx)
+	// 3.5. Rotate stale orders: time-based + spread-widened + competition-spiked
+	staleExpired := pe.rotateStaleOrders(ctx, oppByCondition)
 	if staleExpired > 0 {
 		slog.Info("paper: rotated stale orders", "pairs_freed", staleExpired)
 	}
 
-	// 4. Check fills on existing open orders (with queue-adjusted logic)
+	// 4. Check fills on existing open/partial orders (FIFO + partial fill tracking)
 	fills, err := pe.checkFills(ctx)
 	if err != nil {
 		slog.Warn("paper: error checking fills", "err", err)
 	}
 	result.NewFills = fills
 
-	// 4.5. Merge complete pairs → compound rotation
+	// 4.5. Merge complete pairs → compound rotation (with gas cost + delay)
 	merges, mergeProfit, err := pe.mergeCompletePairs(ctx)
 	if err != nil {
 		slog.Warn("paper: error merging pairs", "err", err)
@@ -141,11 +156,11 @@ func (pe *PaperEngine) RunOnce(ctx context.Context) (*PaperCycleResult, error) {
 		activeSet[c] = true
 	}
 
-	currentCapital := pe.calculateDeployedCapital(ctx)
+	deployedOpen, deployedPartial, deployedFilled := pe.calculateDeployedCapital(ctx)
+	currentCapital := deployedOpen + deployedPartial + deployedFilled
 	result.CapitalDeployed = currentCapital
 
-	// Strategy 9: Kelly Criterion — determines max deployable fraction of bankroll
-	// With little data: conservative (50%). As fills confirm: deploy more.
+	// Kelly Criterion — determines max deployable fraction of bankroll
 	kellyF := pe.kellyFraction(ctx)
 	result.KellyFraction = kellyF
 	bankroll := pe.cfg.InitialCapital + totalMergeProfit
@@ -158,8 +173,7 @@ func (pe *PaperEngine) RunOnce(ctx context.Context) (*PaperCycleResult, error) {
 		"deployed", fmt.Sprintf("$%.2f", currentCapital),
 	)
 
-	// Strategy 4+6: sort opportunities by compound velocity score
-	// (shorter queues + higher profit per pair = faster compound cycles)
+	// Sort opportunities by compound velocity score (shorter queues + higher profit = faster cycles)
 	sort.Slice(opps, func(i, j int) bool {
 		return compoundVelocityScore(opps[i]) > compoundVelocityScore(opps[j])
 	})
@@ -186,7 +200,7 @@ func (pe *PaperEngine) RunOnce(ctx context.Context) (*PaperCycleResult, error) {
 			continue
 		}
 
-		// Strategy 2: competition-aware adaptive sizing, capped to affordable amount
+		// Competition-aware adaptive sizing, capped to affordable amount
 		orderSize := pe.optimalOrderSize(opp)
 		maxAffordable := (effectiveCapital - currentCapital) / 2
 		if orderSize > maxAffordable {
@@ -194,7 +208,6 @@ func (pe *PaperEngine) RunOnce(ctx context.Context) (*PaperCycleResult, error) {
 		}
 		if orderSize < paperMinOrderSize {
 			if currentCapital == 0 {
-				// First order: use whatever we can afford
 				orderSize = maxAffordable
 			}
 			if orderSize < 1 {
@@ -218,7 +231,7 @@ func (pe *PaperEngine) RunOnce(ctx context.Context) (*PaperCycleResult, error) {
 	result.NewOrders = newOrders
 	result.CapitalDeployed = currentCapital
 
-	// 6. Build positions with reward accrual + spread check (GAP #1, #5)
+	// 6. Build positions with reward accrual + spread check
 	positions, err := pe.buildPositions(ctx, oppByCondition)
 	if err != nil {
 		slog.Warn("paper: error building positions", "err", err)
@@ -253,7 +266,6 @@ func (pe *PaperEngine) RunOnce(ctx context.Context) (*PaperCycleResult, error) {
 					"side", partialSide(pos), "hours", dur.Hours())
 			}
 		}
-		// GAP #6: warn about positions near resolution
 		if pos.HoursToEnd > 0 && pos.HoursToEnd < 48 && !pos.IsResolved {
 			result.Warnings = append(result.Warnings,
 				fmt.Sprintf("NEAR END (%.0fh): %s", pos.HoursToEnd, truncateStr(pos.Question, 30)))
@@ -272,7 +284,8 @@ func (pe *PaperEngine) placeVirtualOrders(ctx context.Context, opp domain.Opport
 	return pe.placeVirtualOrdersWithSize(ctx, opp, pe.cfg.OrderSize)
 }
 
-// placeVirtualOrdersWithSize creates a YES+NO order pair with bid optimization and adaptive sizing.
+// placeVirtualOrdersWithSize creates a YES+NO order pair with multi-tick bid optimization.
+// YES and NO bids are optimized jointly to ensure yesBid + noBid < 1.0 after any tick-ups.
 func (pe *PaperEngine) placeVirtualOrdersWithSize(ctx context.Context, opp domain.Opportunity, orderSize float64) error {
 	pairID := uuid.New().String()
 	now := time.Now().UTC()
@@ -289,24 +302,23 @@ func (pe *PaperEngine) placeVirtualOrdersWithSize(ctx context.Context, opp domai
 	yesQueue := queuePosition(opp.YesBook, yesBid)
 	noQueue := queuePosition(opp.NoBook, noBid)
 
-	yesBidOpt, noBidOpt := yesBid, noBid
-	optimized := false
-	if yesQueue > orderSize {
-		candidate := yesBid + paperBidTickUp
-		if domain.FillCostPerEvent(candidate, noBid, pe.cfg.FeeRate) <= 0 {
-			yesBidOpt = candidate
-			yesQueue = 0
-			optimized = true
-		}
+	// Multi-tick bid optimization: try 1c, 2c, 3c tick-ups.
+	// Optimize YES first, then NO, maintaining joint profitability constraint.
+	yesBidOpt, yesQueueOpt := pe.optimizeBid(opp.YesBook, yesBid, noBid, orderSize, pe.cfg.FeeRate, true)
+	noBidOpt, noQueueOpt := pe.optimizeBid(opp.NoBook, noBid, yesBidOpt, orderSize, pe.cfg.FeeRate, false)
+
+	// Safety guard: if joint optimization breaks profitability, fall back to originals
+	if domain.FillCostPerEvent(yesBidOpt, noBidOpt, pe.cfg.FeeRate) > 0 {
+		yesBidOpt = yesBid
+		noBidOpt = noBid
+		yesQueueOpt = yesQueue
+		noQueueOpt = noQueue
 	}
-	if noQueue > orderSize {
-		candidate := noBid + paperBidTickUp
-		if domain.FillCostPerEvent(yesBidOpt, candidate, pe.cfg.FeeRate) <= 0 {
-			noBidOpt = candidate
-			noQueue = 0
-			optimized = true
-		}
-	}
+
+	optimized := yesBidOpt != yesBid || noBidOpt != noBid
+
+	// Use bid-depth-only competition for reward estimation
+	bidCompetition := opp.YesBook.BidDepthWithinUSDC(0.05) + opp.NoBook.BidDepthWithinUSDC(0.05)
 
 	yesOrder := domain.VirtualOrder{
 		ID:          uuid.New().String(),
@@ -319,7 +331,7 @@ func (pe *PaperEngine) placeVirtualOrdersWithSize(ctx context.Context, opp domai
 		Status:      domain.PaperStatusOpen,
 		PairID:      pairID,
 		Question:    opp.Market.Question,
-		QueueAhead:  yesQueue,
+		QueueAhead:  yesQueueOpt,
 		DailyReward: opp.YourDailyReward,
 		EndDate:     opp.Market.EndDate,
 	}
@@ -335,7 +347,7 @@ func (pe *PaperEngine) placeVirtualOrdersWithSize(ctx context.Context, opp domai
 		Status:      domain.PaperStatusOpen,
 		PairID:      pairID,
 		Question:    opp.Market.Question,
-		QueueAhead:  noQueue,
+		QueueAhead:  noQueueOpt,
 		DailyReward: opp.YourDailyReward,
 		EndDate:     opp.Market.EndDate,
 	}
@@ -349,7 +361,8 @@ func (pe *PaperEngine) placeVirtualOrdersWithSize(ctx context.Context, opp domai
 
 	optLabel := ""
 	if optimized {
-		optLabel = " [BID OPTIMIZED +1c]"
+		optLabel = fmt.Sprintf(" [BID OPT Y+%.0fc N+%.0fc]",
+			(yesBidOpt-yesBid)*100, (noBidOpt-noBid)*100)
 	}
 	sizeLabel := ""
 	if orderSize != pe.cfg.OrderSize {
@@ -360,8 +373,9 @@ func (pe *PaperEngine) placeVirtualOrdersWithSize(ctx context.Context, opp domai
 		"yesBid", fmt.Sprintf("%.4f", yesBidOpt),
 		"noBid", fmt.Sprintf("%.4f", noBidOpt),
 		"size", fmt.Sprintf("$%.0f", orderSize),
-		"yesQueue", fmt.Sprintf("$%.0f", yesQueue),
-		"noQueue", fmt.Sprintf("$%.0f", noQueue),
+		"yesQueue", fmt.Sprintf("$%.0f", yesQueueOpt),
+		"noQueue", fmt.Sprintf("$%.0f", noQueueOpt),
+		"bidCompetition", fmt.Sprintf("$%.0f", bidCompetition),
 		"reward", fmt.Sprintf("$%.4f/d", opp.YourDailyReward),
 		"endIn", fmt.Sprintf("%.0fh", opp.Market.HoursToResolution()),
 	)
@@ -369,7 +383,63 @@ func (pe *PaperEngine) placeVirtualOrdersWithSize(ctx context.Context, opp domai
 	return nil
 }
 
-// expireResolvedAndNearEnd handles GAP #3 (market resolution) and GAP #6/#7 (near-end).
+// optimizeBid tries 1c, 2c, 3c tick-ups on a bid and picks the best one.
+// The other side's bid (counterBid) is held fixed for joint profitability checks.
+// isYesSide=true means we're optimizing YES (counterBid is NO), false means we're optimizing NO.
+func (pe *PaperEngine) optimizeBid(
+	book domain.OrderBook,
+	currentBid, counterBid, orderSize, feeRate float64,
+	isYesSide bool,
+) (bestBid float64, bestQueue float64) {
+	bestBid = currentBid
+	bestQueue = queuePosition(book, currentBid)
+
+	// Only optimize if queue ahead is large enough to justify it
+	if bestQueue <= orderSize {
+		return
+	}
+
+	bestScore := bidOptScore(bestQueue, orderSize, 0.0)
+
+	for ticks := 1; float64(ticks)*paperBidTickStep <= paperMaxBidTickUp; ticks++ {
+		candidate := currentBid + float64(ticks)*paperBidTickStep
+
+		// Ensure joint profitability after tick-up
+		var fillCost float64
+		if isYesSide {
+			fillCost = domain.FillCostPerEvent(candidate, counterBid, feeRate)
+		} else {
+			fillCost = domain.FillCostPerEvent(counterBid, candidate, feeRate)
+		}
+		if fillCost > 0 {
+			break // would destroy profitability, stop trying
+		}
+
+		newQueue := queuePosition(book, candidate)
+		tickCost := float64(ticks) * paperBidTickStep * orderSize
+		score := bidOptScore(newQueue, orderSize, tickCost)
+
+		if score > bestScore {
+			bestScore = score
+			bestBid = candidate
+			bestQueue = newQueue
+		}
+	}
+
+	return bestBid, bestQueue
+}
+
+// bidOptScore ranks a bid optimization choice: shorter queue is good, but tick cost reduces profit.
+// Returns expected "effective speed" = orderSize / (queue + orderSize) - normalized tick cost.
+func bidOptScore(queue, orderSize, tickCost float64) float64 {
+	if orderSize <= 0 {
+		return 0
+	}
+	fillSpeedProxy := orderSize / (queue + orderSize + 1)
+	return fillSpeedProxy - tickCost/orderSize
+}
+
+// expireResolvedAndNearEnd handles market resolution and near-end expiry.
 func (pe *PaperEngine) expireResolvedAndNearEnd(ctx context.Context, oppByCondition map[string]domain.Opportunity) int {
 	openOrders, err := pe.store.GetOpenPaperOrders(ctx)
 	if err != nil {
@@ -395,7 +465,6 @@ func (pe *PaperEngine) expireResolvedAndNearEnd(ctx context.Context, oppByCondit
 
 		// Check 2: market no longer appears in scan → may have resolved or closed
 		if _, exists := oppByCondition[order.ConditionID]; !exists {
-			// Market disappeared from the scan — likely resolved or deactivated
 			if !order.EndDate.IsZero() && time.Until(order.EndDate) < 0 {
 				shouldExpire = true
 				reason = "RESOLVED (disappeared)"
@@ -428,7 +497,8 @@ func (pe *PaperEngine) expireResolvedAndNearEnd(ctx context.Context, oppByCondit
 	return resolved
 }
 
-// refreshQueues updates queueAhead for open orders using current book data (GAP #4).
+// refreshQueues updates queueAhead for OPEN orders using current book data.
+// PARTIAL orders keep their original queue so fill calculation stays consistent.
 func (pe *PaperEngine) refreshQueues(ctx context.Context, oppByCondition map[string]domain.Opportunity) {
 	openOrders, err := pe.store.GetOpenPaperOrders(ctx)
 	if err != nil {
@@ -436,6 +506,11 @@ func (pe *PaperEngine) refreshQueues(ctx context.Context, oppByCondition map[str
 	}
 
 	for _, order := range openOrders {
+		// Skip PARTIAL orders — their queue was already consumed in prior cycles.
+		if order.Status == domain.PaperStatusPartial {
+			continue
+		}
+
 		opp, exists := oppByCondition[order.ConditionID]
 		if !exists {
 			continue
@@ -455,7 +530,15 @@ func (pe *PaperEngine) refreshQueues(ctx context.Context, oppByCondition map[str
 	}
 }
 
-// checkFills fetches recent trades and simulates queue-aware filling.
+// checkFills fetches recent trades and simulates queue-aware filling with partial fill support.
+//
+// Fill model:
+//   - Accumulate SELL volume (at or below bid) from order.PlacedAt
+//   - When cumSellUSDC > QueueAhead: we start getting filled
+//   - effectiveFilled = cumSellUSDC - QueueAhead (capped at order.Size)
+//   - If effectiveFilled > order.FilledSize: new fill detected
+//   - Partial: effectiveFilled < order.Size → update FilledSize, set PARTIAL
+//   - Complete: effectiveFilled >= order.Size → mark FILLED
 func (pe *PaperEngine) checkFills(ctx context.Context) (int, error) {
 	openOrders, err := pe.store.GetOpenPaperOrders(ctx)
 	if err != nil {
@@ -480,7 +563,6 @@ func (pe *PaperEngine) checkFills(ctx context.Context) (int, error) {
 			continue
 		}
 
-		// GAP #5: log trade data coverage
 		if len(trades) > 0 {
 			window := tradeCoverage(trades)
 			if window < time.Hour {
@@ -492,33 +574,34 @@ func (pe *PaperEngine) checkFills(ctx context.Context) (int, error) {
 			}
 		}
 
-		// Sort trades by timestamp for proper queue simulation
+		// Sort trades by timestamp: oldest first for proper FIFO queue simulation
 		sort.Slice(trades, func(i, j int) bool {
 			return trades[i].Timestamp.Before(trades[j].Timestamp)
 		})
 
 		for _, order := range orders {
+			// Accumulate total SELL volume at or below our bid, from PlacedAt
 			var cumSellUSDC float64
-			var fillTrade *domain.Trade
+			var lastSellTrade *domain.Trade
 
 			for i := range trades {
 				t := &trades[i]
 				if t.Timestamp.Before(order.PlacedAt) {
 					continue
 				}
+				// Only SELL trades at or below our bid price consume our queue position.
+				// (Taker sells into bids; maker buys at bid price.)
 				if t.Side != "SELL" || t.Price > order.BidPrice {
 					continue
 				}
-
 				cumSellUSDC += t.Size * t.Price
-
-				if cumSellUSDC > order.QueueAhead+order.Size {
-					fillTrade = t
-					break
-				}
+				lastSellTrade = t
 			}
 
-			if fillTrade == nil {
+			// How much of our order has been reached by sell flow
+			effectiveFilled := cumSellUSDC - order.QueueAhead
+			if effectiveFilled <= 0 {
+				// Queue not yet consumed
 				if cumSellUSDC > 0 {
 					slog.Debug("paper: sell volume hasn't reached us yet",
 						"side", order.Side,
@@ -531,39 +614,89 @@ func (pe *PaperEngine) checkFills(ctx context.Context) (int, error) {
 				continue
 			}
 
-			// Maker limit orders fill at the BID price, not the taker's trade price
-			if err := pe.store.MarkPaperOrderFilled(ctx, order.ID, fillTrade.Timestamp, order.BidPrice); err != nil {
-				slog.Warn("paper: error marking order filled", "err", err)
-				continue
-			}
-			fill := domain.PaperFill{
-				OrderID:   order.ID,
-				TradeID:   fillTrade.ID,
-				Price:     order.BidPrice,
-				Size:      order.Size,
-				Timestamp: fillTrade.Timestamp,
-			}
-			if err := pe.store.SavePaperFill(ctx, fill); err != nil {
-				slog.Warn("paper: error saving fill", "err", err)
+			// Cap at order size
+			if effectiveFilled > order.Size {
+				effectiveFilled = order.Size
 			}
 
-			slog.Info("paper: order FILLED (queue-adjusted)",
-				"side", order.Side,
-				"market", truncateStr(order.Question, 30),
-				"bidPrice", fmt.Sprintf("%.4f", order.BidPrice),
-				"triggerPrice", fmt.Sprintf("%.4f", fillTrade.Price),
-				"queueAhead", fmt.Sprintf("$%.0f", order.QueueAhead),
-				"sellVolNeeded", fmt.Sprintf("$%.0f", cumSellUSDC),
-			)
+			// Detect new fill progress since last check
+			newlyFilled := effectiveFilled - order.FilledSize
+			if newlyFilled <= 0 {
+				continue // no new fills this cycle
+			}
 
-			totalFills++
+			fillPrice := order.BidPrice // maker limit orders fill at their bid price
+			fillTime := time.Now().UTC()
+			if lastSellTrade != nil {
+				fillTime = lastSellTrade.Timestamp
+			}
+
+			if effectiveFilled >= order.Size {
+				// Complete fill
+				if err := pe.store.MarkPaperOrderFilled(ctx, order.ID, fillTime, fillPrice); err != nil {
+					slog.Warn("paper: error marking order filled", "err", err)
+					continue
+				}
+				fill := domain.PaperFill{
+					OrderID:   order.ID,
+					TradeID:   tradeID(lastSellTrade),
+					Price:     fillPrice,
+					Size:      order.Size,
+					Timestamp: fillTime,
+				}
+				if err := pe.store.SavePaperFill(ctx, fill); err != nil {
+					slog.Warn("paper: error saving fill", "err", err)
+				}
+
+				slog.Info("paper: order FILLED",
+					"side", order.Side,
+					"market", truncateStr(order.Question, 30),
+					"bidPrice", fmt.Sprintf("%.4f", fillPrice),
+					"queueAhead", fmt.Sprintf("$%.0f", order.QueueAhead),
+					"totalSellVol", fmt.Sprintf("$%.0f", cumSellUSDC),
+					"prevFilled", fmt.Sprintf("$%.2f", order.FilledSize),
+				)
+				totalFills++
+			} else {
+				// Partial fill: update FilledSize, keep order active
+				if err := pe.store.UpdatePaperOrderPartialFill(ctx, order.ID, effectiveFilled, fillPrice); err != nil {
+					slog.Warn("paper: error updating partial fill", "err", err)
+					continue
+				}
+				fill := domain.PaperFill{
+					OrderID:   order.ID,
+					TradeID:   tradeID(lastSellTrade),
+					Price:     fillPrice,
+					Size:      newlyFilled,
+					Timestamp: fillTime,
+				}
+				if err := pe.store.SavePaperFill(ctx, fill); err != nil {
+					slog.Warn("paper: error saving partial fill", "err", err)
+				}
+
+				pct := 100 * effectiveFilled / order.Size
+				slog.Info("paper: order PARTIAL FILL",
+					"side", order.Side,
+					"market", truncateStr(order.Question, 30),
+					"filled", fmt.Sprintf("$%.2f / $%.2f (%.0f%%)", effectiveFilled, order.Size, pct),
+					"newThisCycle", fmt.Sprintf("$%.2f", newlyFilled),
+				)
+			}
 		}
 	}
 
 	return totalFills, nil
 }
 
-// buildPositions reconstructs positions with reward accrual (GAP #1) and spread check (GAP #5).
+// tradeID returns a trade ID string or empty string if nil.
+func tradeID(t *domain.Trade) string {
+	if t == nil {
+		return ""
+	}
+	return t.ID
+}
+
+// buildPositions reconstructs positions with block-based reward accrual and spread check.
 func (pe *PaperEngine) buildPositions(ctx context.Context, oppByCondition map[string]domain.Opportunity) ([]domain.PaperPosition, error) {
 	allOrders, err := pe.store.GetAllPaperOrders(ctx, "")
 	if err != nil {
@@ -589,17 +722,17 @@ func (pe *PaperEngine) buildPositions(ctx context.Context, oppByCondition map[st
 			switch o.Side {
 			case "YES":
 				pos.YesOrder = o
-				pos.YesFilled = o.Status == domain.PaperStatusFilled
+				pos.YesFilled = o.Status == domain.PaperStatusFilled || o.Status == domain.PaperStatusMerged
 			case "NO":
 				pos.NoOrder = o
-				pos.NoFilled = o.Status == domain.PaperStatusFilled
+				pos.NoFilled = o.Status == domain.PaperStatusFilled || o.Status == domain.PaperStatusMerged
 			}
 		}
 
 		pos.IsComplete = pos.YesFilled && pos.NoFilled
 		pos.IsResolved = allResolved(orders)
 
-		// Partial detection
+		// Partial detection: one side filled, other not
 		if (pos.YesFilled && !pos.NoFilled) || (!pos.YesFilled && pos.NoFilled) {
 			var filledAt *time.Time
 			if pos.YesFilled && pos.YesOrder != nil && pos.YesOrder.FilledAt != nil {
@@ -617,14 +750,17 @@ func (pe *PaperEngine) buildPositions(ctx context.Context, oppByCondition map[st
 			pos.CapitalDeployed = pos.YesOrder.Size + pos.NoOrder.Size
 		}
 
-		// GAP #1: Reward accrual — calculate how much reward this position earned
+		// Block-based reward accrual: accrue in discrete 15-minute blocks.
+		// This prevents inflating rewards with fractional time and matches
+		// Polymarket's actual reward settlement cadence.
 		if pos.YesOrder != nil && pos.YesOrder.DailyReward > 0 {
 			pos.DailyReward = pos.YesOrder.DailyReward
 			activeHours := pe.activeHours(pos)
-			pos.RewardAccrued = pos.DailyReward * (activeHours / 24.0)
+			blocks := float64(int(activeHours * 60 / paperBlockMinutes)) // floor to whole blocks
+			pos.RewardAccrued = pos.DailyReward * (blocks * paperBlockMinutes / 60.0 / 24.0)
 		}
 
-		// GAP #5: Check spread qualification with current data
+		// Check spread qualification with current data
 		if opp, exists := oppByCondition[pos.ConditionID]; exists {
 			pos.SpreadQualifies = opp.QualifiesReward
 			pos.HoursToEnd = opp.Market.HoursToResolution()
@@ -639,7 +775,6 @@ func (pe *PaperEngine) buildPositions(ctx context.Context, oppByCondition map[st
 // activeHours returns how many hours orders in this position have been active.
 func (pe *PaperEngine) activeHours(pos domain.PaperPosition) float64 {
 	var earliest time.Time
-	var latest time.Time
 
 	if pos.YesOrder != nil {
 		earliest = pos.YesOrder.PlacedAt
@@ -652,9 +787,9 @@ func (pe *PaperEngine) activeHours(pos domain.PaperPosition) float64 {
 		return 0
 	}
 
-	// Active until: filled (both sides), expired, resolved, or now
-	latest = time.Now()
-	if pos.IsComplete && pos.YesOrder.FilledAt != nil && pos.NoOrder.FilledAt != nil {
+	latest := time.Now()
+	if pos.IsComplete && pos.YesOrder != nil && pos.NoOrder != nil &&
+		pos.YesOrder.FilledAt != nil && pos.NoOrder.FilledAt != nil {
 		// Use the LATER fill time (when both sides were done)
 		if pos.YesOrder.FilledAt.After(*pos.NoOrder.FilledAt) {
 			latest = *pos.YesOrder.FilledAt
@@ -666,19 +801,28 @@ func (pe *PaperEngine) activeHours(pos domain.PaperPosition) float64 {
 	return latest.Sub(earliest).Hours()
 }
 
-// calculateDeployedCapital sums the Size of all OPEN and FILLED orders.
-func (pe *PaperEngine) calculateDeployedCapital(ctx context.Context) float64 {
-	openOrders, _ := pe.store.GetOpenPaperOrders(ctx)
-	filledOrders, _ := pe.store.GetAllPaperOrders(ctx, "FILLED")
+// calculateDeployedCapital returns capital broken down by order state.
+//
+//   - OPEN orders: full Size reserved (not yet filled, can't be used)
+//   - PARTIAL orders: unfilled portion still reserved + filled portion invested in tokens
+//   - FILLED orders: full Size invested in tokens (awaiting merge)
+func (pe *PaperEngine) calculateDeployedCapital(ctx context.Context) (deployedOpen, deployedPartial, deployedFilled float64) {
+	openOrders, _ := pe.store.GetOpenPaperOrders(ctx) // returns OPEN + PARTIAL
+	filledOrders, _ := pe.store.GetAllPaperOrders(ctx, string(domain.PaperStatusFilled))
 
-	total := 0.0
 	for _, o := range openOrders {
-		total += o.Size
+		switch o.Status {
+		case domain.PaperStatusOpen:
+			deployedOpen += o.Size
+		case domain.PaperStatusPartial:
+			// Remaining unfilled portion is still in the order book
+			deployedPartial += o.Size
+		}
 	}
 	for _, o := range filledOrders {
-		total += o.Size
+		deployedFilled += o.Size
 	}
-	return total
+	return
 }
 
 // saveDailySummary persists today's paper trading summary.
@@ -697,11 +841,17 @@ func (pe *PaperEngine) saveDailySummary(ctx context.Context, result *PaperCycleR
 			continue
 		}
 		hasActive := false
-		if pos.YesOrder != nil && (pos.YesOrder.Status == domain.PaperStatusOpen || pos.YesOrder.Status == domain.PaperStatusFilled) {
-			hasActive = true
+		if pos.YesOrder != nil {
+			s := pos.YesOrder.Status
+			if s == domain.PaperStatusOpen || s == domain.PaperStatusFilled || s == domain.PaperStatusPartial {
+				hasActive = true
+			}
 		}
-		if pos.NoOrder != nil && (pos.NoOrder.Status == domain.PaperStatusOpen || pos.NoOrder.Status == domain.PaperStatusFilled) {
-			hasActive = true
+		if pos.NoOrder != nil {
+			s := pos.NoOrder.Status
+			if s == domain.PaperStatusOpen || s == domain.PaperStatusFilled || s == domain.PaperStatusPartial {
+				hasActive = true
+			}
 		}
 		if !hasActive {
 			continue
@@ -710,7 +860,6 @@ func (pe *PaperEngine) saveDailySummary(ctx context.Context, result *PaperCycleR
 		active++
 		if pos.IsComplete {
 			complete++
-			// GAP #1: fill PnL uses maker fee (already in FillCostPair via config FeeRate)
 			if pos.FillCostPair < 0 {
 				fillPnL += -pos.FillCostPair * (pe.cfg.OrderSize / maxF(pos.YesOrder.BidPrice, 0.01))
 			}
@@ -787,14 +936,25 @@ func allResolved(orders []domain.VirtualOrder) bool {
 	return false
 }
 
+// queuePosition returns the USDC value of bids at EXACTLY the same price level.
+// FIFO applies within a price level: only same-price bids are ahead of us.
+// Bids at higher prices will have already been filled before the market price reaches our level.
 func queuePosition(book domain.OrderBook, bidPrice float64) float64 {
 	total := 0.0
 	for _, entry := range book.Bids {
-		if entry.Price >= bidPrice {
+		// Only count bids at the SAME price level (FIFO within level)
+		if abs64(entry.Price-bidPrice) < 0.001 {
 			total += entry.Size * entry.Price
 		}
 	}
 	return total
+}
+
+func abs64(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 func partialSide(pos domain.PaperPosition) string {
@@ -822,7 +982,10 @@ func maxF(a, b float64) float64 {
 }
 
 // mergeCompletePairs finds all pairs with both sides FILLED and simulates
-// the CTF merge (YES+NO → $1.00), freeing capital for compound rotation.
+// the CTF merge (YES+NO → $1.00), with:
+//   - Gas cost deducted (paperMergeGasCost per merge)
+//   - Minimum delay after last fill (paperMergeDelayMins)
+//   - Skip if merge is unprofitable after gas
 func (pe *PaperEngine) mergeCompletePairs(ctx context.Context) (merges int, totalProfit float64, err error) {
 	filledOrders, err := pe.store.GetAllPaperOrders(ctx, string(domain.PaperStatusFilled))
 	if err != nil {
@@ -835,6 +998,7 @@ func (pe *PaperEngine) mergeCompletePairs(ctx context.Context) (merges int, tota
 	}
 
 	now := time.Now().UTC()
+	mergeDelay := time.Duration(paperMergeDelayMins) * time.Minute
 
 	for _, orders := range byPair {
 		var yes, no *domain.VirtualOrder
@@ -850,6 +1014,23 @@ func (pe *PaperEngine) mergeCompletePairs(ctx context.Context) (merges int, tota
 			continue
 		}
 
+		// Wait at least paperMergeDelayMins after the LAST fill before merging
+		// (simulates blockchain tx confirmation time)
+		lastFillTime := yes.PlacedAt
+		if yes.FilledAt != nil && yes.FilledAt.After(lastFillTime) {
+			lastFillTime = *yes.FilledAt
+		}
+		if no.FilledAt != nil && no.FilledAt.After(lastFillTime) {
+			lastFillTime = *no.FilledAt
+		}
+		if now.Sub(lastFillTime) < mergeDelay {
+			slog.Debug("paper: merge delayed (waiting for confirmation)",
+				"market", truncateStr(yes.Question, 30),
+				"waitRemaining", fmt.Sprintf("%.0fs", mergeDelay.Seconds()-now.Sub(lastFillTime).Seconds()),
+			)
+			continue
+		}
+
 		yesPrice := yes.FilledPrice
 		if yesPrice == 0 {
 			yesPrice = yes.BidPrice
@@ -859,13 +1040,24 @@ func (pe *PaperEngine) mergeCompletePairs(ctx context.Context) (merges int, tota
 			noPrice = no.BidPrice
 		}
 
-		// Spread = $1 - YES price - NO price (profit per merged share pair)
+		// Spread = $1 - YES price - NO price (gross profit per merged share pair)
 		spread := 1.0 - yesPrice - noPrice
 		yesShares := yes.Size / yesPrice
 		noShares := no.Size / noPrice
 		mergeable := min(yesShares, noShares)
-		profit := mergeable * spread
-		capitalUsed := mergeable * (yesPrice + noPrice)
+		grossProfit := mergeable * spread
+
+		// Deduct gas cost; skip merge if not profitable
+		netProfit := grossProfit - paperMergeGasCost
+		if netProfit <= 0 {
+			slog.Info("paper: skipping merge (unprofitable after gas)",
+				"market", truncateStr(yes.Question, 30),
+				"spread", fmt.Sprintf("$%.4f", spread),
+				"grossProfit", fmt.Sprintf("$%.4f", grossProfit),
+				"gasCost", fmt.Sprintf("$%.4f", paperMergeGasCost),
+			)
+			continue
+		}
 
 		if err := pe.store.MarkPaperOrderMerged(ctx, yes.ID, now); err != nil {
 			slog.Warn("paper: error marking YES as merged", "err", err)
@@ -877,24 +1069,26 @@ func (pe *PaperEngine) mergeCompletePairs(ctx context.Context) (merges int, tota
 		}
 
 		cycleTime := now.Sub(yes.PlacedAt)
+		capitalUsed := mergeable * (yesPrice + noPrice)
 		slog.Info("paper: MERGED pair (compound rotation)",
 			"market", truncateStr(yes.Question, 30),
 			"spread", fmt.Sprintf("$%.4f", spread),
 			"shares", fmt.Sprintf("%.1f", mergeable),
-			"profit", fmt.Sprintf("$%.4f", profit),
+			"grossProfit", fmt.Sprintf("$%.4f", grossProfit),
+			"netProfit", fmt.Sprintf("$%.4f", netProfit),
+			"gasCost", fmt.Sprintf("$%.4f", paperMergeGasCost),
 			"capital_used", fmt.Sprintf("$%.2f", capitalUsed),
 			"cycle", fmt.Sprintf("%.1fh", cycleTime.Hours()),
 		)
 
 		merges++
-		totalProfit += profit
+		totalProfit += netProfit
 	}
 
 	return merges, totalProfit, nil
 }
 
-// getCompoundMetrics computes the compound balance and rotation stats from all
-// MERGED orders in the database.
+// getCompoundMetrics computes the compound balance and rotation stats from all MERGED orders.
 func (pe *PaperEngine) getCompoundMetrics(ctx context.Context) (balance, totalProfit float64, rotations int, avgCycleHours float64) {
 	mergedOrders, err := pe.store.GetAllPaperOrders(ctx, string(domain.PaperStatusMerged))
 	if err != nil {
@@ -935,9 +1129,10 @@ func (pe *PaperEngine) getCompoundMetrics(ctx context.Context) (balance, totalPr
 		yesShares := yes.Size / yesPrice
 		noShares := no.Size / noPrice
 		mergeable := min(yesShares, noShares)
-		profit := mergeable * spread
+		grossProfit := mergeable * spread
+		netProfit := grossProfit - paperMergeGasCost
 
-		totalProfit += profit
+		totalProfit += netProfit
 		rotations++
 
 		if yes.MergedAt != nil {
@@ -945,7 +1140,9 @@ func (pe *PaperEngine) getCompoundMetrics(ctx context.Context) (balance, totalPr
 		}
 	}
 
-	deployed := pe.calculateDeployedCapital(ctx)
+	// Balance = initial + merged profits - capital still deployed
+	deployedOpen, deployedPartial, deployedFilled := pe.calculateDeployedCapital(ctx)
+	deployed := deployedOpen + deployedPartial + deployedFilled
 	balance = pe.cfg.InitialCapital + totalProfit - deployed
 
 	if rotations > 0 {
@@ -956,15 +1153,12 @@ func (pe *PaperEngine) getCompoundMetrics(ctx context.Context) (balance, totalPr
 }
 
 // kellyFraction computes the optimal fraction of bankroll to deploy using
-// the Kelly Criterion. (Strategy 9)
+// the Kelly Criterion. Uses half-Kelly for safety.
 //
 //	f* = (p × b - q) / b
 //	p = probability of completing a pair (both fills)
 //	b = profit / capital when pair completes
 //	q = 1 - p
-//
-// Uses half-Kelly for safety (standard practice in professional trading).
-// Returns a fraction [0.1, 1.0] that grows as paper data confirms the edge.
 func (pe *PaperEngine) kellyFraction(ctx context.Context) float64 {
 	stats, err := pe.store.GetPaperStats(ctx)
 	if err != nil || stats.TotalOrders < 50 {
@@ -1020,10 +1214,11 @@ func (pe *PaperEngine) kellyFraction(ctx context.Context) float64 {
 	}
 }
 
-// rotateStaleOrders cancels order pairs where BOTH sides are still OPEN
-// after paperStaleHours. This frees capital for markets with faster fills.
-// (Strategy 6: Dynamic Rotation)
-func (pe *PaperEngine) rotateStaleOrders(ctx context.Context) int {
+// rotateStaleOrders cancels order pairs where BOTH sides are still OPEN based on:
+//  1. Time-based: both sides OPEN > paperStaleHours with no fills
+//  2. Spread-widened: current spread exceeds the strategy max (market conditions deteriorated)
+//  3. Competition spike: competition grew 3x since placement (reward diluted too much)
+func (pe *PaperEngine) rotateStaleOrders(ctx context.Context, oppByCondition map[string]domain.Opportunity) int {
 	openOrders, err := pe.store.GetOpenPaperOrders(ctx)
 	if err != nil {
 		return 0
@@ -1031,7 +1226,10 @@ func (pe *PaperEngine) rotateStaleOrders(ctx context.Context) int {
 
 	byPair := make(map[string][]domain.VirtualOrder)
 	for _, o := range openOrders {
-		byPair[o.PairID] = append(byPair[o.PairID], o)
+		// Only consider OPEN orders (not PARTIAL — one side is filling, keep it)
+		if o.Status == domain.PaperStatusOpen {
+			byPair[o.PairID] = append(byPair[o.PairID], o)
+		}
 	}
 
 	expired := 0
@@ -1040,6 +1238,7 @@ func (pe *PaperEngine) rotateStaleOrders(ctx context.Context) int {
 			continue
 		}
 
+		// Check both are still OPEN (not one PARTIAL, one OPEN)
 		allOpen := true
 		var oldest time.Time
 		for _, o := range orders {
@@ -1051,26 +1250,56 @@ func (pe *PaperEngine) rotateStaleOrders(ctx context.Context) int {
 				oldest = o.PlacedAt
 			}
 		}
-
 		if !allOpen || oldest.IsZero() {
 			continue
 		}
 
 		age := time.Since(oldest).Hours()
-		if age < paperStaleHours {
+		conditionID := orders[0].ConditionID
+		rotateReason := ""
+
+		// Reason 1: stale by time
+		if age >= paperStaleHours {
+			rotateReason = fmt.Sprintf("stale (%.1fh, no fills)", age)
+		}
+
+		// Reason 2: spread widened beyond max (market deteriorated)
+		if rotateReason == "" {
+			if opp, exists := oppByCondition[conditionID]; exists {
+				if opp.FillCostPerPair > 0 {
+					rotateReason = fmt.Sprintf("spread no longer profitable (fillCost $%.4f > 0)", opp.FillCostPerPair)
+				}
+			}
+		}
+
+		// Reason 3: competition spiked 3x since placement
+		if rotateReason == "" {
+			if opp, exists := oppByCondition[conditionID]; exists {
+				// Use bid-depth-only competition (the realistic measure for reward farming)
+				currentComp := opp.YesBook.BidDepthWithinUSDC(0.05) + opp.NoBook.BidDepthWithinUSDC(0.05)
+				// Compare against what was recorded at placement (orders[0] has the original competition proxy)
+				// We use QueueAhead as a proxy for original competition at placement time
+				originalCompProxy := orders[0].QueueAhead + orders[1].QueueAhead
+				if originalCompProxy > 0 && currentComp > originalCompProxy*paperCompetitionMultiplier {
+					rotateReason = fmt.Sprintf("competition spiked %.1fx (now $%.0f vs $%.0f at placement)",
+						currentComp/originalCompProxy, currentComp, originalCompProxy)
+				}
+			}
+		}
+
+		if rotateReason == "" {
 			continue
 		}
 
-		conditionID := orders[0].ConditionID
 		if err := pe.store.ExpirePaperOrders(ctx, conditionID); err != nil {
 			slog.Warn("paper: error expiring stale pair", "err", err)
 			continue
 		}
 
-		slog.Info("paper: ROTATED stale pair (no fills)",
+		slog.Info("paper: ROTATED pair",
+			"reason", rotateReason,
 			"market", truncateStr(orders[0].Question, 30),
 			"age", fmt.Sprintf("%.1fh", age),
-			"queueY", fmt.Sprintf("$%.0f", orders[0].QueueAhead),
 		)
 		expired++
 	}
@@ -1079,8 +1308,6 @@ func (pe *PaperEngine) rotateStaleOrders(ctx context.Context) int {
 }
 
 // compoundVelocityScore ranks opportunities by expected compound rotation speed.
-// Higher score = faster fills + more profit per pair = better for compound growth.
-// (Strategy 4: New market timing + Strategy 6: Dynamic rotation)
 func compoundVelocityScore(opp domain.Opportunity) float64 {
 	yesQueue := queuePosition(opp.YesBook, opp.YesBook.BestBid())
 	noQueue := queuePosition(opp.NoBook, opp.NoBook.BestBid())
@@ -1109,7 +1336,11 @@ func compoundVelocityScore(opp domain.Opportunity) float64 {
 // The marginal reward curve is concave: dR/ds = dailyRate × C / (s+C)².
 // For low-competition markets we deploy more; for high-competition less.
 func (pe *PaperEngine) optimalOrderSize(opp domain.Opportunity) float64 {
-	competition := opp.Competition
+	// Use bid-only competition (more accurate for reward farming)
+	competition := opp.YesBook.BidDepthWithinUSDC(0.05) + opp.NoBook.BidDepthWithinUSDC(0.05)
+	if competition <= 0 {
+		competition = opp.Competition
+	}
 	if competition <= 0 {
 		competition = 1
 	}
@@ -1119,23 +1350,6 @@ func (pe *PaperEngine) optimalOrderSize(opp domain.Opportunity) float64 {
 		return pe.cfg.OrderSize
 	}
 
-	// Marginal reward: dR/ds = dailyRate * C / (s + C)²
-	// At s = 0: dR/ds = dailyRate / C  (maximum marginal return)
-	// We want to allocate proportionally to sqrt(dailyRate * C)
-	// which is the KKT optimal solution s* = sqrt(dailyRate * C / lambda) - C
-	// Simplified: ratio against default, clamped to [min, 2×default]
-	marginalAtDefault := dailyRate * competition / ((pe.cfg.OrderSize + competition) * (pe.cfg.OrderSize + competition))
-	marginalAtZero := dailyRate / competition
-
-	if marginalAtZero <= 0 {
-		return pe.cfg.OrderSize
-	}
-
-	// Ratio: how much better is this market vs average
-	ratio := marginalAtDefault / marginalAtZero
-	// Lower competition → higher ratio → more capital
-	// Invert: ratio is lower when competition is lower (more attractive)
-	// Use sqrt(dailyRate / competition) as the signal
 	attractiveness := dailyRate / competition
 	baseAttractiveness := dailyRate / (competition + pe.cfg.OrderSize)
 
@@ -1144,7 +1358,6 @@ func (pe *PaperEngine) optimalOrderSize(opp domain.Opportunity) float64 {
 		scaleFactor = attractiveness / baseAttractiveness
 	}
 
-	// Clamp: between paperMinOrderSize and 2x default
 	optimal := pe.cfg.OrderSize * scaleFactor
 	if optimal > pe.cfg.OrderSize*2 {
 		optimal = pe.cfg.OrderSize * 2
@@ -1153,15 +1366,13 @@ func (pe *PaperEngine) optimalOrderSize(opp domain.Opportunity) float64 {
 		optimal = paperMinOrderSize
 	}
 
-	// Log when size differs significantly from default
 	if optimal != pe.cfg.OrderSize && (optimal < pe.cfg.OrderSize*0.8 || optimal > pe.cfg.OrderSize*1.2) {
 		slog.Debug("paper: adaptive sizing",
 			"market", truncateStr(opp.Market.Question, 25),
 			"default", fmt.Sprintf("$%.0f", pe.cfg.OrderSize),
 			"optimal", fmt.Sprintf("$%.0f", optimal),
-			"competition", fmt.Sprintf("$%.0f", competition),
+			"bidCompetition", fmt.Sprintf("$%.0f", competition),
 			"dailyRate", fmt.Sprintf("$%.2f", dailyRate),
-			"ratio", fmt.Sprintf("%.2f", ratio),
 		)
 	}
 

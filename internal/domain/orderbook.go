@@ -96,6 +96,23 @@ func (ob OrderBook) DepthWithinUSDC(maxSpread float64) float64 {
 	return total
 }
 
+// BidDepthWithinUSDC calculates the USDC value (size × price) of BID orders only
+// within a given spread relative to the midpoint.
+// Use this for competition in reward farming: only bids compete for liquidity rewards.
+func (ob OrderBook) BidDepthWithinUSDC(maxSpread float64) float64 {
+	mid := ob.Midpoint()
+	if mid == 0 {
+		return 0
+	}
+	var total float64
+	for _, b := range ob.Bids {
+		if mid-b.Price <= maxSpread {
+			total += b.Size * b.Price
+		}
+	}
+	return total
+}
+
 // ParsePrice convierte un string de precio a float64.
 // Usado en el mapping de la API.
 func ParsePrice(s string) float64 {
