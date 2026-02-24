@@ -3,12 +3,10 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/alejandrodnm/polybot/config"
 	"github.com/alejandrodnm/polybot/internal/adapters/notify"
@@ -30,6 +28,15 @@ func main() {
 	paperReport := flag.Bool("paper-report", false, "print paper trading report and exit")
 	paperMarkets := flag.Int("paper-markets", 10, "max simultaneous markets in paper mode")
 	paperCapital := flag.Float64("paper-capital", 1000, "initial capital for compound rotation tracking (USDC)")
+
+	live := flag.Bool("live", false, "run REAL MONEY trading engine (requires POLY_PRIVATE_KEY env var)")
+	liveReport := flag.Bool("live-report", false, "print live trading report and exit")
+	liveCapital := flag.Float64("live-capital", 20, "initial capital for live trading (USDC)")
+	liveMaxExposure := flag.Float64("live-max-exposure", 50, "max total USDC deployed at any time")
+	liveOrderSize := flag.Float64("live-order-size", 5, "target order size per side in USDC")
+	liveMaxMarkets := flag.Int("live-markets", 5, "max simultaneous markets in live mode")
+	polygonRPC := flag.String("polygon-rpc", "https://polygon-rpc.com", "Polygon RPC endpoint for on-chain merges")
+
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -90,188 +97,52 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Paper report: just print and exit
-	if *paperReport {
+	switch {
+	case *liveReport:
+		runLiveReport(ctx, store)
+
+	case *paperReport:
 		runPaperReport(ctx, store, notifier, *paperCapital)
-		return
-	}
 
-	// Backtest mode
-	if *backtest {
+	case *backtest:
 		runBacktest(ctx, s, client, notifier, scanCfg.OrderSize)
-		return
-	}
 
-	// Paper trading mode
-	if *paper {
+	case *paper:
 		runPaper(ctx, s, client, store, notifier, scanner.PaperConfig{
 			OrderSize:      cfg.Scanner.OrderSizeUSDC,
 			MaxMarkets:     *paperMarkets,
 			FeeRate:        cfg.Scanner.FeeRateDefault,
 			InitialCapital: *paperCapital,
 		})
-		return
-	}
 
-	if err := s.Run(ctx); err != nil {
-		slog.Error("scanner exited with error", "err", err)
-		os.Exit(1)
-	}
-
-	slog.Info("polybot stopped cleanly")
-}
-
-func runBacktest(ctx context.Context, s *scanner.Scanner, client *polymarket.Client, notifier *notify.Console, orderSize float64) {
-	slog.Info("=== BACKTEST MODE: scan + cross-reference with real trades ===")
-
-	opps, err := s.RunOnce(ctx)
-	if err != nil {
-		slog.Error("scan failed", "err", err)
-		os.Exit(1)
-	}
-
-	if len(opps) == 0 {
-		slog.Warn("no opportunities found — nothing to backtest")
-		return
-	}
-
-	if err := notifier.Notify(ctx, opps); err != nil {
-		slog.Warn("notifier error", "err", err)
-	}
-
-	slog.Info("fetching real trades for top markets...", "count", min(10, len(opps)))
-
-	results, err := scanner.Backtest(ctx, opps, client, orderSize)
-	if err != nil {
-		slog.Error("backtest failed", "err", err)
-		os.Exit(1)
-	}
-
-	notifier.PrintBacktest(results)
-	slog.Info("backtest complete", "markets_tested", len(results))
-}
-
-func runPaper(ctx context.Context, s *scanner.Scanner, client *polymarket.Client, store *storage.SQLiteStorage, notifier *notify.Console, cfg scanner.PaperConfig) {
-	slog.Info("=== PAPER TRADING MODE (compound rotation) ===",
-		"order_size", cfg.OrderSize,
-		"max_markets", cfg.MaxMarkets,
-		"initial_capital", cfg.InitialCapital,
-	)
-
-	if err := store.ApplyPaperSchema(ctx); err != nil {
-		slog.Error("failed to create paper trading tables", "err", err)
-		os.Exit(1)
-	}
-
-	// Use DryRun=true for scanner so it doesn't persist to regular tables
-	pe := scanner.NewPaperEngine(s, client, store, cfg)
-
-	// Check for STOP file as kill switch
-	stopFile := "STOP"
-
-	ticker := time.NewTicker(60 * time.Second)
-	defer ticker.Stop()
-
-	slog.Info("paper trading started — press Ctrl+C or create STOP file to exit")
-	fmt.Printf("[PAPER] Starting compound rotation loop (60s interval, capital $%.0f)...\n", cfg.InitialCapital)
-
-	// Run first cycle immediately
-	runPaperCycle(ctx, pe, notifier, cfg.InitialCapital)
-
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("paper trading stopped (signal)")
-			printPaperExitSummary(ctx, store, notifier, cfg.InitialCapital)
-			return
-		case <-ticker.C:
-			if _, err := os.Stat(stopFile); err == nil {
-				slog.Info("STOP file detected — shutting down paper trading")
-				os.Remove(stopFile)
-				printPaperExitSummary(ctx, store, notifier, cfg.InitialCapital)
-				return
-			}
-			runPaperCycle(ctx, pe, notifier, cfg.InitialCapital)
+	case *live:
+		privKey := os.Getenv("POLY_PRIVATE_KEY")
+		if privKey == "" {
+			slog.Error("POLY_PRIVATE_KEY environment variable is required for live trading")
+			os.Exit(1)
 		}
-	}
-}
+		rpcURL := os.Getenv("POLYGON_RPC")
+		if rpcURL == "" {
+			rpcURL = *polygonRPC
+		}
+		orderSize := *liveOrderSize
+		if orderSize <= 0 {
+			orderSize = cfg.Scanner.OrderSizeUSDC
+		}
+		runLive(ctx, s, store, scanner.LiveConfig{
+			OrderSize:      orderSize,
+			MaxMarkets:     *liveMaxMarkets,
+			FeeRate:        cfg.Scanner.FeeRateDefault,
+			InitialCapital: *liveCapital,
+			MaxExposure:    *liveMaxExposure,
+			MinMergeProfit: 0.05,
+		}, privKey, cfg.API.CLOBBase, cfg.API.GammaBase, rpcURL)
 
-func runPaperCycle(ctx context.Context, pe *scanner.PaperEngine, notifier *notify.Console, initialCapital float64) {
-	result, err := pe.RunOnce(ctx)
-	if err != nil {
-		slog.Error("paper cycle failed", "err", err)
-		return
-	}
-
-	notifier.PrintPaperStatus(notify.PaperStatusInput{
-		Positions:        result.Positions,
-		NewOrders:        result.NewOrders,
-		NewFills:         result.NewFills,
-		Alerts:           result.PartialAlerts,
-		Warnings:         result.Warnings,
-		CapitalDeployed:  result.CapitalDeployed,
-		Merges:           result.Merges,
-		MergeProfit:      result.MergeProfit,
-		CompoundBalance:  result.CompoundBalance,
-		TotalRotations:   result.TotalRotations,
-		TotalMergeProfit: result.MergeProfit,
-		InitialCapital:   initialCapital,
-		AvgCycleHours:    result.AvgCycleHours,
-		KellyFraction:    result.KellyFraction,
-	})
-}
-
-func runPaperReport(ctx context.Context, store *storage.SQLiteStorage, notifier *notify.Console, initialCapital float64) {
-	if err := store.ApplyPaperSchema(ctx); err != nil {
-		slog.Error("failed to init paper schema", "err", err)
-		os.Exit(1)
-	}
-
-	stats, err := store.GetPaperStats(ctx)
-	if err != nil {
-		slog.Error("failed to get paper stats", "err", err)
-		os.Exit(1)
-	}
-
-	stats.InitialCapital = initialCapital
-	if stats.InitialCapital > 0 {
-		stats.CompoundGrowth = (stats.InitialCapital + stats.TotalMergeProfit) / stats.InitialCapital
-	}
-	notifier.PrintPaperReport(stats)
-}
-
-func printPaperExitSummary(ctx context.Context, store *storage.SQLiteStorage, notifier *notify.Console, initialCapital float64) {
-	stats, err := store.GetPaperStats(ctx)
-	if err != nil {
-		slog.Warn("could not generate exit summary", "err", err)
-		return
-	}
-	stats.InitialCapital = initialCapital
-	if stats.InitialCapital > 0 {
-		stats.CompoundGrowth = (stats.InitialCapital + stats.TotalMergeProfit) / stats.InitialCapital
-	}
-	notifier.PrintPaperReport(stats)
-}
-
-func setupLogger(cfg config.LogConfig) {
-	var level slog.Level
-	switch cfg.Level {
-	case "debug":
-		level = slog.LevelDebug
-	case "warn":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
 	default:
-		level = slog.LevelInfo
+		if err := s.Run(ctx); err != nil {
+			slog.Error("scanner exited with error", "err", err)
+			os.Exit(1)
+		}
+		slog.Info("polybot stopped cleanly")
 	}
-
-	opts := &slog.HandlerOptions{Level: level}
-	var handler slog.Handler
-	if cfg.Format == "json" {
-		handler = slog.NewJSONHandler(os.Stdout, opts)
-	} else {
-		handler = slog.NewTextHandler(os.Stdout, opts)
-	}
-	slog.SetDefault(slog.New(handler))
 }

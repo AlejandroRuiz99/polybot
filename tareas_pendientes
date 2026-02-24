@@ -1,0 +1,18 @@
+1.preguntar que hace el backtest y posiblemente borrar
+2.comprobar la distrubicion de archivos dentro de cmd, revisar modularizacion
+deberia quedar solo un archivo main pero sin ser excisavemnte largo.
+3.contexto del live que hace, deberia ser asi?
+4.configs del main exportar a yaml
+5.mejorar paper trading
+6.documentacion sobre que es lo que muestra la consola, y posibles mejoras
+7.crear logs debug descriptivos en cada fase de la estrategia para poder depurarla 
+via cursor.
+8.crear modulo/herramienta que ejecute un grep de los 3 ultimos ciclos de la terminal
+para deparurar estrategia y ahorrar tokens en medio plazo.
+9.todo lo que este relacionado con estrategia, procesos, comprobaciones, moverlo a
+archivo/carpeta de archivos de forma que este localizado, sea depurable y sea facil añadir 
+quitar cosas.
+10. mover las configuraciones hardcodeadas a al config yaml, crear perfiles de configuraciones
+y evaluar el rendimiento de cada perfil para saber cual es la mejor configuracion
+11. aun no sabemos si el merge funciona porque aun no se ha dado
+12.

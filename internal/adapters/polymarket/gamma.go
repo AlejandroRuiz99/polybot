@@ -53,7 +53,7 @@ func (c *Client) fetchGammaMetadata(ctx context.Context, conditionIDs []string) 
 		}
 		batch := conditionIDs[i:end]
 
-		url := fmt.Sprintf("%s%s?condition_id=%s&limit=%d",
+		url := fmt.Sprintf("%s%s?condition_ids=%s&limit=%d",
 			c.gammaBase,
 			gammaMarketsPath,
 			strings.Join(batch, ","),

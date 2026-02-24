@@ -3,7 +3,7 @@ CMD        := ./cmd/scanner
 BUILD_DIR  := bin
 GOFLAGS    := -trimpath
 
-.PHONY: all build test lint run run-once run-dry backtest paper paper-report clean tidy
+.PHONY: all build test lint run run-once run-dry backtest paper paper-report live live-report live-stop clean tidy
 
 all: build
 
@@ -34,6 +34,18 @@ paper: build
 
 paper-report: build
 	./$(BUILD_DIR)/$(BINARY) --config config/config.yaml --paper-report --paper-capital 1000
+
+live: build
+	./$(BUILD_DIR)/$(BINARY) \
+		--config config/config.yaml --live \
+		--live-capital 7 --live-max-exposure 7 \
+		--live-order-size 2 --live-markets 3 --verbose
+
+live-report: build
+	./$(BUILD_DIR)/$(BINARY) --config config/config.yaml --live-report
+
+live-stop:
+	touch STOP_LIVE
 
 clean:
 	rm -rf $(BUILD_DIR) coverage.out

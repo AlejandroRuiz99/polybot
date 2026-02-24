@@ -68,6 +68,11 @@ func New(
 	}
 }
 
+// SetFilter replaces the scanner's filter (used by live engine to widen criteria).
+func (s *Scanner) SetFilter(f *Filter) {
+	s.filter = f
+}
+
 // Run ejecuta el loop de escaneo hasta que el contexto se cancele.
 // Si cfg.DryRun está activo, solo ejecuta un ciclo.
 func (s *Scanner) Run(ctx context.Context) error {
