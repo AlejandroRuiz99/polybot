@@ -1,4 +1,4 @@
-package polygon
+package onchain
 
 // merge.go — On-chain CTF merge executor for Polymarket.
 //

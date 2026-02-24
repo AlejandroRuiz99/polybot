@@ -15,25 +15,8 @@ import (
 type Config struct {
 	ScanInterval    time.Duration
 	Filter          FilterConfig
-	OrderSize       float64
-	FeeRate         float64
-	FillsPerDay     float64 // fills estimados/día para cálculo arb profit
-	GoldMinReward   float64 // mínimo YourDailyReward para categoría Gold
-	AnalysisWorkers int     // goroutines para análisis paralelo (0 = NumCPU*2)
+	AnalysisWorkers int // goroutines para análisis paralelo (0 = NumCPU*2)
 	DryRun          bool
-}
-
-// DefaultConfig devuelve una configuración sensata para producción.
-func DefaultConfig() Config {
-	return Config{
-		ScanInterval:    30 * time.Second,
-		Filter:          DefaultFilterConfig(),
-		OrderSize:       defaultOrderSize,
-		FeeRate:         defaultFeeRate,
-		FillsPerDay:     2.0,
-		GoldMinReward:   0.50,
-		AnalysisWorkers: 0, // auto (NumCPU*2)
-	}
 }
 
 // Scanner es el orquestador principal del loop de escaneo.
@@ -49,12 +32,14 @@ type Scanner struct {
 }
 
 // New crea un Scanner con todas las dependencias inyectadas.
+// La strategy se inyecta desde fuera (cmd/) para respetar la inversión de dependencias.
 func New(
 	cfg Config,
 	markets ports.MarketProvider,
 	books ports.BookProvider,
 	storage ports.Storage,
 	notifier ports.Notifier,
+	strategy StrategyAnalyzer,
 ) *Scanner {
 	return &Scanner{
 		cfg:             cfg,
@@ -62,7 +47,7 @@ func New(
 		books:           books,
 		storage:         storage,
 		notifier:        notifier,
-		analyzer:        NewAnalyzer(cfg.OrderSize, cfg.FeeRate, cfg.FillsPerDay, cfg.GoldMinReward),
+		analyzer:        NewAnalyzer(strategy),
 		filter:          NewFilter(cfg.Filter),
 		previousGoldIDs: make(map[string]bool),
 	}

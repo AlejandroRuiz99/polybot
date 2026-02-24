@@ -80,3 +80,20 @@ func (m Market) NoToken() Token {
 	}
 	return m.Tokens[1]
 }
+
+// TruncateQuestion devuelve la pregunta del mercado truncada a maxLen caracteres.
+// Si la pregunta está vacía usa los primeros caracteres del conditionID como fallback.
+func TruncateQuestion(question, conditionID string, maxLen int) string {
+	q := question
+	if q == "" {
+		if len(conditionID) > 20 {
+			q = conditionID[:20] + "..."
+		} else {
+			q = conditionID
+		}
+	}
+	if len(q) > maxLen {
+		q = q[:maxLen-3] + "..."
+	}
+	return q
+}

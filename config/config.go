@@ -12,9 +12,32 @@ import (
 // Config es la configuración completa del scanner.
 type Config struct {
 	Scanner ScannerConfig `yaml:"scanner"`
+	Paper   PaperConfig   `yaml:"paper"`
+	Live    LiveConfig    `yaml:"live"`
 	API     APIConfig     `yaml:"api"`
 	Storage StorageConfig `yaml:"storage"`
 	Log     LogConfig     `yaml:"log"`
+}
+
+// PaperConfig controla el engine de paper trading.
+type PaperConfig struct {
+	MaxMarkets     int     `yaml:"max_markets"`
+	InitialCapital float64 `yaml:"initial_capital"`
+}
+
+// LiveConfig controla el engine de live trading.
+type LiveConfig struct {
+	OrderSize      float64 `yaml:"order_size"`
+	MaxMarkets     int     `yaml:"max_markets"`
+	InitialCapital float64 `yaml:"initial_capital"`
+	MaxExposure    float64 `yaml:"max_exposure"`
+	MinMergeProfit float64 `yaml:"min_merge_profit"`
+	PolygonRPC     string  `yaml:"polygon_rpc"`
+
+	// Filtros de entrada para el live engine (sobreescribe scanner filter).
+	MaxSpreadTotal float64 `yaml:"max_spread_total"`
+	MaxCompetition float64 `yaml:"max_competition"`
+	OnlyFillsProfit bool   `yaml:"only_fills_profit"`
 }
 
 // ScannerConfig controla el comportamiento del scanner.
@@ -108,6 +131,36 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Scanner.GoldMinReward <= 0 {
 		cfg.Scanner.GoldMinReward = 0.01 // mínimo $0.01/día de reward para entrar en Gold/Silver
+	}
+	if cfg.Paper.MaxMarkets <= 0 {
+		cfg.Paper.MaxMarkets = 10
+	}
+	if cfg.Paper.InitialCapital <= 0 {
+		cfg.Paper.InitialCapital = 1000
+	}
+	if cfg.Live.OrderSize <= 0 {
+		cfg.Live.OrderSize = 5
+	}
+	if cfg.Live.MaxMarkets <= 0 {
+		cfg.Live.MaxMarkets = 5
+	}
+	if cfg.Live.InitialCapital <= 0 {
+		cfg.Live.InitialCapital = 20
+	}
+	if cfg.Live.MaxExposure <= 0 {
+		cfg.Live.MaxExposure = 50
+	}
+	if cfg.Live.MinMergeProfit <= 0 {
+		cfg.Live.MinMergeProfit = 0.05
+	}
+	if cfg.Live.PolygonRPC == "" {
+		cfg.Live.PolygonRPC = "https://polygon-rpc.com"
+	}
+	if cfg.Live.MaxSpreadTotal <= 0 {
+		cfg.Live.MaxSpreadTotal = 0.20
+	}
+	if cfg.Live.MaxCompetition <= 0 {
+		cfg.Live.MaxCompetition = 100_000
 	}
 	if cfg.API.CLOBBase == "" {
 		cfg.API.CLOBBase = "https://clob.polymarket.com"

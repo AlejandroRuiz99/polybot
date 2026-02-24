@@ -38,4 +38,7 @@ type LiveStorage interface {
 	SaveLiveDaily(ctx context.Context, d domain.LiveDailySummary) error
 	GetLiveDailies(ctx context.Context) ([]domain.LiveDailySummary, error)
 	GetLiveStats(ctx context.Context) (domain.LiveStats, error)
+
+	// GetPartialPairs devuelve los pairIDs donde solo un lado (YES o NO) está filled.
+	GetPartialPairs(ctx context.Context) ([]string, error)
 }

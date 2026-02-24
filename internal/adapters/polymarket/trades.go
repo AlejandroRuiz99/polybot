@@ -77,46 +77,6 @@ func (c *Client) FetchTrades(ctx context.Context, tokenID string) ([]domain.Trad
 	return all, nil
 }
 
-// FetchTradesByCondition obtiene todos los trades de un mercado por condition_id.
-func (c *Client) FetchTradesByCondition(ctx context.Context, conditionID string) ([]domain.Trade, error) {
-	var all []domain.Trade
-
-	for page := 0; page < tradesMaxPages; page++ {
-		offset := page * tradesPerPage
-		url := fmt.Sprintf("%s/trades?market=%s&limit=%d&offset=%d",
-			dataAPIBase, conditionID, tradesPerPage, offset)
-
-		var resp []rawDataTrade
-		if err := c.get(ctx, c.clobLimiter, url, &resp); err != nil {
-			return nil, fmt.Errorf("data-api.FetchTradesByCondition: %w", err)
-		}
-
-		if len(resp) == 0 {
-			break
-		}
-
-		for _, rt := range resp {
-			price, _ := rt.Price.Float64()
-			size, _ := rt.Size.Float64()
-			ts := parseTradeTimestamp(rt.Timestamp)
-
-			all = append(all, domain.Trade{
-				ID:        rt.ID,
-				TokenID:   rt.Asset,
-				Side:      rt.Side,
-				Price:     price,
-				Size:      size,
-				Timestamp: ts,
-			})
-		}
-
-		if len(resp) < tradesPerPage {
-			break
-		}
-	}
-
-	return all, nil
-}
 
 func parseTradeTimestamp(n json.Number) time.Time {
 	s := n.String()

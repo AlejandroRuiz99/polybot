@@ -18,6 +18,21 @@ scanner:
   gold_min_reward: 0.01
   analysis_workers: 0               # auto (NumCPU*2)
 
+paper:
+  max_markets: 10
+  initial_capital: 1000             # USDC simulados iniciales
+
+live:
+  order_size: 5                     # USDC por lado
+  max_markets: 5
+  initial_capital: 20               # USDC iniciales
+  max_exposure: 50                  # máximo USDC desplegado simultáneamente
+  min_merge_profit: 0.05            # mínimo beneficio neto para ejecutar merge
+  polygon_rpc: "https://polygon-rpc.com"
+  max_spread_total: 0.20            # filtro de spread para el live engine
+  max_competition: 100000           # filtro de competencia para el live engine
+  only_fills_profit: true           # solo mercados donde fills son rentables
+
 api:
   clob_base: "https://clob.polymarket.com"
   gamma_base: "https://gamma-api.polymarket.com"

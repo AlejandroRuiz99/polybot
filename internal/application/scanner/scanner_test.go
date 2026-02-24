@@ -8,7 +8,8 @@ import (
 
 	"github.com/alejandrodnm/polybot/internal/domain"
 	"github.com/alejandrodnm/polybot/internal/ports"
-	"github.com/alejandrodnm/polybot/internal/scanner"
+	"github.com/alejandrodnm/polybot/internal/application/scanner"
+	"github.com/alejandrodnm/polybot/internal/domain/strategy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -93,10 +94,19 @@ func makeBooks(yesID, noID string) map[string]domain.OrderBook {
 }
 
 func newTestScanner(mp ports.MarketProvider, bp ports.BookProvider, n ports.Notifier, s ports.Storage) *scanner.Scanner {
-	cfg := scanner.DefaultConfig()
-	cfg.Filter.RequireQualifies = true
-	cfg.Filter.MinRewardScore = 0
-	return scanner.New(cfg, mp, bp, s, n)
+	cfg := scanner.Config{
+		Filter: scanner.FilterConfig{
+			RequireQualifies: true,
+			MinRewardScore:   0,
+		},
+	}
+	strat := strategy.NewRewardFarming(strategy.RewardFarmingConfig{
+		OrderSize:     100,
+		FeeRate:       0.02,
+		FillsPerDay:   2.0,
+		GoldMinReward: 0.01,
+	})
+	return scanner.New(cfg, mp, bp, s, n, strat)
 }
 
 // --- tests ---

@@ -510,6 +510,41 @@ func (s *SQLiteStorage) GetLiveStats(ctx context.Context) (domain.LiveStats, err
 	return stats, nil
 }
 
+// GetPartialPairs devuelve los pairIDs donde solo uno de los dos lados (YES/NO) está filled.
+func (s *SQLiteStorage) GetPartialPairs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT pair_id, side FROM live_orders WHERE status IN ('FILLED','PARTIAL')`)
+	if err != nil {
+		return nil, fmt.Errorf("storage.GetPartialPairs: query: %w", err)
+	}
+	defer rows.Close()
+
+	type sides struct{ yes, no bool }
+	pairSides := make(map[string]*sides)
+	for rows.Next() {
+		var pairID, side string
+		if err := rows.Scan(&pairID, &side); err != nil {
+			return nil, fmt.Errorf("storage.GetPartialPairs: scan: %w", err)
+		}
+		if pairSides[pairID] == nil {
+			pairSides[pairID] = &sides{}
+		}
+		if side == "YES" {
+			pairSides[pairID].yes = true
+		} else {
+			pairSides[pairID].no = true
+		}
+	}
+
+	var partials []string
+	for pairID, s := range pairSides {
+		if s.yes != s.no {
+			partials = append(partials, pairID)
+		}
+	}
+	return partials, nil
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func nullTime(t *time.Time) any {

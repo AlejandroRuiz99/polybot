@@ -11,15 +11,16 @@ alwaysApply: true
 
 ## Arquitectura hexagonal
 ```
-cmd/scanner/        → entrypoint, wiring de dependencias
-internal/domain/    → entidades puras, cero imports externos
-internal/ports/     → interfaces (contratos entre capas)
-internal/adapters/  → implementaciones concretas (HTTP, SQLite, consola)
-internal/scanner/   → orquestador + analyzer + filter
-internal/strategy/  → lógica de reward farming
-config/             → carga YAML + .env
+cmd/polybot/                    → entrypoint, wiring de dependencias
+internal/domain/                → entidades puras, cero imports externos
+internal/domain/strategy/       → domain services (lógica de evaluación)
+internal/ports/                 → interfaces (contratos entre capas)
+internal/adapters/              → implementaciones concretas (HTTP, SQLite, consola)
+internal/application/scanner/   → caso de uso: fetch → analyze → filter → rank
+internal/application/engine/    → caso de uso: ejecución (live + paper)
+config/                         → carga YAML + .env
 ```
-**Regla:** el dominio NO importa adapters ni ports. Los adapters importan ports. El scanner importa ports y domain.
+**Regla:** domain NO importa nada externo. ports importa domain. adapters importa domain. application importa ports + domain.
 
 ## Naming
 - Interfaces con sustantivo: `MarketProvider`, `BookProvider`, `Notifier`.

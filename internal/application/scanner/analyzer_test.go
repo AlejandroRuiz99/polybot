@@ -6,9 +6,19 @@ import (
 	"testing"
 
 	"github.com/alejandrodnm/polybot/internal/domain"
+	"github.com/alejandrodnm/polybot/internal/domain/strategy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func newTestAnalyzer(orderSize, feeRate, fillsPerDay, goldMinReward float64) *Analyzer {
+	return NewAnalyzer(strategy.NewRewardFarming(strategy.RewardFarmingConfig{
+		OrderSize:     orderSize,
+		FeeRate:       feeRate,
+		FillsPerDay:   fillsPerDay,
+		GoldMinReward: goldMinReward,
+	}))
+}
 
 func makeBook(tokenID string, bid, ask, size float64) domain.OrderBook {
 	return domain.OrderBook{
@@ -26,7 +36,7 @@ func TestAnalyzer_Analyze_Success(t *testing.T) {
 	yesBook := makeBook("yes", 0.70, 0.72, 200)
 	noBook := makeBook("no", 0.27, 0.29, 180)
 
-	a := NewAnalyzer(100, 0.02, 1.0, 0.01)
+	a := newTestAnalyzer(100, 0.02, 1.0, 0.01)
 	opp, err := a.Analyze(context.Background(), market, yesBook, noBook)
 
 	require.NoError(t, err)
@@ -50,7 +60,7 @@ func TestAnalyzer_Analyze_Success(t *testing.T) {
 
 func TestAnalyzer_Analyze_EmptyBook(t *testing.T) {
 	market := domain.Market{ConditionID: "0xtest"}
-	a := NewAnalyzer(100, 0.02, 1.0, 0.01)
+	a := newTestAnalyzer(100, 0.02, 1.0, 0.01)
 	_, err := a.Analyze(context.Background(), market, domain.OrderBook{}, domain.OrderBook{})
 	assert.Error(t, err)
 }
@@ -62,7 +72,7 @@ func TestAnalyzer_Analyze_TrueArbitrage(t *testing.T) {
 	yesBook := makeBook("yes", 0.48, 0.49, 100)
 	noBook := makeBook("no", 0.48, 0.49, 100)
 
-	a := NewAnalyzer(100, 0.001, 1.0, 0.01)
+	a := newTestAnalyzer(100, 0.001, 1.0, 0.01)
 	opp, err := a.Analyze(context.Background(), market, yesBook, noBook)
 
 	require.NoError(t, err)
@@ -83,7 +93,7 @@ func TestAnalyzer_Analyze_NearArb_IsGold(t *testing.T) {
 	yesBook := makeBook("yes", 0.49, 0.50, 100)
 	noBook := makeBook("no", 0.49, 0.50, 100)
 
-	a := NewAnalyzer(100, 0.001, 1.0, 0.01)
+	a := newTestAnalyzer(100, 0.001, 1.0, 0.01)
 	opp, err := a.Analyze(context.Background(), market, yesBook, noBook)
 
 	require.NoError(t, err)
@@ -98,7 +108,7 @@ func TestAnalyzer_Analyze_HighSpread_IsSilver(t *testing.T) {
 	yesBook := makeBook("yes", 0.70, 0.72, 200)
 	noBook := makeBook("no", 0.27, 0.29, 180)
 
-	a := NewAnalyzer(100, 0.02, 1.0, 0.01)
+	a := newTestAnalyzer(100, 0.02, 1.0, 0.01)
 	opp, err := a.Analyze(context.Background(), market, yesBook, noBook)
 
 	require.NoError(t, err)
